@@ -1,13 +1,16 @@
+// app/api/answer/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// ---------- Types ----------
 type TavilyItem = { url: string; title?: string; content?: string };
 type TavilyResp = { results?: TavilyItem[] };
 
-const TAVILY_KEY = process.env.TAVILY_API_KEY!;
-const GEMINI_KEY = process.env.GEMINI_API_KEY!;
+// ---------- Env ----------
+const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
+const GEMINI_KEY = process.env.GEMINI_API_KEY || "";
 
-// -------- Tavily search -----------------------------------------------------
+// ---------- Tavily search ----------
 async function webSearch(q: string): Promise<TavilyItem[]> {
   if (!TAVILY_KEY) return [];
   const r = await fetch("https://api.tavily.com/search", {
@@ -26,20 +29,21 @@ async function webSearch(q: string): Promise<TavilyItem[]> {
   return data.results ?? [];
 }
 
-// -------- Utils for HTML ----------------------------------------------------
+// ---------- Minimal HTML helpers ----------
 function ul(items: string[]) {
-  return `<ul style="margin:6px 0 0; padding-left: 20px">${items
+  return `<ul style="margin:6px 0 0; padding-left:22px">${items
     .map((i) => `<li>${i}</li>`)
     .join("")}</ul>`;
 }
+
 function sec(title: string, items: string[]) {
   if (!items.length) return "";
-  return `<div style="margin-bottom:14px"><div style="font-weight:700">${title}</div>${ul(
+  return `<div style="margin-bottom:16px"><div style="font-weight:700">${title}</div>${ul(
     items
   )}</div>`;
 }
 
-// -------- Intent detection + section sets -----------------------------------
+// ---------- Mode detection ----------
 type Mode = "radiology" | "emergency" | "ortho";
 
 function detectMode(q: string): Mode {
@@ -48,28 +52,20 @@ function detectMode(q: string): Mode {
   const radioHits = [
     "xray",
     "x-ray",
-    "xr",
     "radiograph",
-    "ap view",
-    "lateral view",
     "ct",
     "computed tomography",
     "mri",
-    "mr imaging",
     "ultrasound",
     "usg",
     "report",
     "impression",
-    "ddx",
     "differential",
     "findings",
-    "radiology",
-    "slice",
-    "contrast",
     "sequence",
+    "stir",
     "t1",
     "t2",
-    "stir",
   ].some((k) => s.includes(k));
 
   const edHits = [
@@ -77,7 +73,6 @@ function detectMode(q: string): Mode {
     " emergency",
     "triage",
     "resus",
-    "resuscitation",
     "abcde",
     "primary survey",
     "secondary survey",
@@ -94,7 +89,7 @@ function detectMode(q: string): Mode {
 }
 
 function sectionTitlesFor(mode: Mode): string[] {
-  if (mode === "radiology") {
+  if (mode === "radiology")
     return [
       "Clinical Question",
       "Key Imaging Findings",
@@ -102,8 +97,8 @@ function sectionTitlesFor(mode: Mode): string[] {
       "What to Look For",
       "Suggested Report Impression",
     ];
-  }
-  if (mode === "emergency") {
+
+  if (mode === "emergency")
     return [
       "Triage/Red Flags",
       "Initial Stabilization",
@@ -111,7 +106,7 @@ function sectionTitlesFor(mode: Mode): string[] {
       "Immediate Management",
       "Disposition/Follow-up",
     ];
-  }
+
   // Ortho default
   return [
     "Classification",
@@ -122,10 +117,10 @@ function sectionTitlesFor(mode: Mode): string[] {
   ];
 }
 
-// -------- Main handler ------------------------------------------------------
+// ---------- POST handler ----------
 export async function POST(req: NextRequest) {
   try {
-    const { question } = (await req.json()) as { question: string };
+    const { question } = (await req.json()) as { question?: string };
     if (!question || question.trim().length < 3) {
       return NextResponse.json(
         { error: "Ask a valid question." },
@@ -146,67 +141,103 @@ export async function POST(req: NextRequest) {
     }));
 
     if (sources.length === 0) {
-      const html = `<div>No reliable sources found for this query. Please rephrase or try a more specific question.</div>`;
-      return NextResponse.json({ answer: html, sources: [] }, { status: 200 });
+      const html =
+        `<div style="font-weight:700">No reliable sources found</div>` +
+        ul([
+          "Try rephrasing your question.",
+          "Include clinical context (age, mechanism, modality, etc.).",
+        ]);
+      return NextResponse.json(
+        { answer: html, sources: [], mode },
+        { status: 200 }
+      );
     }
 
-    // 2) Build numbered context for Gemini
+    // 2) Numbered context for citations
     const numberedContext = sources
       .map(
-        (s) => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`
+        (s) =>
+          `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`
       )
       .join("\n\n");
 
     const modeHint =
       mode === "radiology"
-        ? "RADIOLOGY style for Indian medical students/junior residents. Focus on imaging findings, differentials, and an exam-ready impression."
+        ? "RADIology style for Indian medical students/junior residents. Focus on imaging findings, differentials, and an exam-ready impression."
         : mode === "emergency"
-        ? "EMERGENCY MEDICINE style for Indian medical students/junior residents. Focus on triage, stabilization, immediate management, and dispo."
+        ? "EMERGENCY MEDICINE style for Indian medical students/junior residents. Focus on triage, stabilization, immediate management, and disposition."
         : "ORTHO/TRAUMA style for Indian medical students/junior residents. Focus on classification and stepwise management.";
 
     const sectionList = titles.map((t, i) => `${i + 1}) ${t}`).join("\n");
 
     const systemPrompt = `
 You are a clinical summarizer. Use ONLY the provided sources. If a fact is absent, omit it. Never invent.
-Write for ${modeHint}
+
+Audience: ${modeHint}
 
 TASK: For the user's question, produce concise, high-yield bullets under these sections:
 ${sectionList}
 
 STRICT RULES:
 - Each bullet must end with inline numeric citations like [1] or [2, 5], matching the source numbers below.
-- Cite ONLY the numbers from the provided SOURCES (no external).
-- Keep each bullet short and practical. Avoid fluff.
-- Output VALID HTML: for each section, render:
+- Cite ONLY numbers from the provided SOURCES.
+- Keep bullets short and practical. Avoid fluff.
+- If a section has no facts supported by the sources, OMIT that section entirely.
+- Output VALID HTML only. For each section, render exactly:
   <div style="font-weight:700">Section Title</div>
   <ul><li>bullet [n]</li>...</ul>
-- No preamble, no conclusion, no "Sources" list (the server will add links).
 
-SOURCES:
+SOURCES (numbered):
 ${numberedContext}
 `.trim();
 
-    // 3) Call Gemini (FIXED: pass a single string instead of an object array)
+    // 3) Call Gemini (safe signature, no role/parts types)
     let htmlAnswer = "";
     if (GEMINI_KEY) {
       try {
         const genAI = new GoogleGenerativeAI(GEMINI_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-        const prompt = `Question: ${question}\n\n${systemPrompt}`;
-        const result = await model.generateContent(prompt);
-        const text = result.response.text().trim();
+        const result = await model.generateContent(
+          `Question: ${question}\n\n${systemPrompt}`
+        );
 
-        // If model already returned valid HTML, use it directly.
-        const looksHtml = /<div[^>]*>.*<\/div>/is.test(text) || /<ul>/.test(text);
+        // raw text and strip ``` fences if present
+        let raw = result.response.text().trim();
+        raw = raw
+          .replace(/^```(?:html)?\s*/i, "")
+          .replace(/```$/i, "")
+          .trim();
+
+        // drop "Not specified ..." bullets the model might add
+        raw = raw.replace(
+          /<li>[^<]*not specified[^<]*<\/li>/gi,
+          ""
+        );
+
+        // remove empty <ul></ul> blocks and sections that became empty
+        raw = raw
+          .replace(/<ul>\s*<\/ul>/gi, "")
+          .replace(
+            /<div[^>]*font-weight:700[^>]*>[^<]*<\/div>\s*(?:<ul>\s*<\/ul>)?/gi,
+            (m) => {
+              // if a section title is followed by nothing, drop the whole block
+              return /<\/div>\s*$/.test(m) ? "" : m;
+            }
+          );
+
+        const looksHtml =
+          /<div[^>]*font-weight:700[^>]*>/.test(raw) || /<ul>/.test(raw);
+
         if (looksHtml) {
-          htmlAnswer = text;
+          htmlAnswer = raw;
         } else {
-          // Minimal transformation (fallback)
-          const blocks = text
+          // Fallback: light parser to build sections from plain text
+          const blocks = raw
             .split(/\n{2,}/)
             .map((b) => b.trim())
             .filter(Boolean);
+
           const mkBullets = (body: string) =>
             body
               .split(/\n|\r/)
@@ -217,37 +248,40 @@ ${numberedContext}
           const acc: S[] = titles.map((t) => ({ title: t, items: [] }));
 
           blocks.forEach((b) => {
-            for (const secn of acc) {
-              const regex = new RegExp(
-                `^\\s*(?:<b>)?${secn.title}[:：]?(?:</b>)?\\s*`,
+            for (const sec of acc) {
+              const re = new RegExp(
+                `^\\s*(?:<b>)?${sec.title}[:：]?(?:</b>)?\\s*`,
                 "i"
               );
-              if (regex.test(b)) {
-                const body = b.replace(regex, "").trim();
-                secn.items.push(...mkBullets(body));
+              if (re.test(b)) {
+                const body = b.replace(re, "").trim();
+                const items = mkBullets(body).filter(
+                  (x) => !/not specified/i.test(x)
+                );
+                sec.items.push(...items);
                 return;
               }
             }
           });
 
           const any = acc.some((s) => s.items.length);
-          if (any) {
-            htmlAnswer = acc.map((s) => sec(s.title, s.items)).join("");
-          } else {
-            htmlAnswer = sec(titles[0], text.split(/\n+/).slice(0, 8));
-          }
+          htmlAnswer = any
+            ? acc.map((s) => sec(s.title, s.items)).join("")
+            : sec(titles[0], raw.split(/\n+/).slice(0, 8));
         }
       } catch {
-        // swallow and use fallback below
+        // swallow and use template fallback
       }
     }
 
-    // 4) Template fallback if LLM failed
+    // 4) Template fallback (never empty)
     if (!htmlAnswer) {
       const safe = (i: number) => `[${i}]`;
       if (mode === "radiology") {
         htmlAnswer =
-          sec("Clinical Question", [`What the study needs to answer ${safe(1)}.`]) +
+          sec("Clinical Question", [
+            `What the study needs to answer ${safe(1)}.`,
+          ]) +
           sec("Key Imaging Findings", [
             `Primary signs, relevant measurements ${safe(1)}.`,
           ]) +
@@ -282,7 +316,9 @@ ${numberedContext}
           sec("Classification", [
             `Key type(s) & radiographic features ${safe(1)}.`,
           ]) +
-          sec("Risk Factors", [`Mechanism, age, typical context in India ${safe(2)}.`]) +
+          sec("Risk Factors", [
+            `Mechanism, age, typical context in India ${safe(2)}.`,
+          ]) +
           sec("Associated Injuries", [
             `Nerve/artery risks; what to document ${safe(3)}.`,
           ]) +
@@ -295,7 +331,7 @@ ${numberedContext}
       }
     }
 
-    // 5) Return
+    // 5) Return (only id/title/url for client)
     const publicSources = sources.map(({ id, title, url }) => ({
       id,
       title,
@@ -307,7 +343,7 @@ ${numberedContext}
     );
   } catch (e: any) {
     return NextResponse.json(
-      { error: e.message || "Server error." },
+      { error: e?.message || "Server error." },
       { status: 500 }
     );
   }
