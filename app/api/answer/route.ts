@@ -1,82 +1,41 @@
-export const runtime = "edge";
+// app/api/answer/route.ts
+import { NextResponse } from "next/server";
 
-type Source = { title: string; url: string; snippet?: string };
+type TavilyResult = { url: string; title: string; content?: string };
 
-// --- Helpers ---------------------------------------------------------------
+const GEMINI_KEY = process.env.GEMINI_API_KEY!;
+const TAVILY_KEY = process.env.TAVILY_API_KEY!;
 
-function toBullets(text: string): string[] {
-  return text
-    .split("\n")
-    .map((line: string) => line.trim())
-    .filter((line: string) => line.length > 0)
-    // strip common bullet markers
-    .map((line: string) => line.replace(/^(\*|\-|\•|\d+\.)\s*/, ""))
-    .filter((line: string) => line.length > 0)
-    .slice(0, 12);
-}
-
-function buildPrompt(question: string, sources?: Source[]) {
-  const srcText =
-    sources && sources.length
-      ? `\n\nUse ONLY these web sources to answer. Cite inline like [1], [2]...\n${sources
-          .map((s, i) => `[${i + 1}] ${s.title} - ${s.url}`)
-          .join("\n")}\n`
-      : "";
-
-  return `You are a medical assistant for Indian MBBS/MD students and junior doctors.
-Answer concisely in structured bullets. Auto-detect the query type and apply the best template:
-
-- Orthopaedics/Trauma: **Classification**, **Risk Factors**, **Associated Injuries**, **Initial Management**, **Definitive/Follow-up**.
-- Radiology: **DDx**, **Key Imaging Features**, **Reporting Phrases**, **Urgent Findings**, **Next Steps**.
-- Emergency: **Primary Survey**, **Immediate Actions**, **Investigations**, **Differentials**, **Disposition/Follow-up**.
-
-Rules:
-- 5–12 bullets total. No prose paragraphs.
-- Keep bold section labels like **Classification:** etc.
-- India-friendly practice wording.
-- If unsure, say so and suggest safe next steps.
-${srcText}
-
-Question: ${question}
-
-Return just bullet lines, one per line.`;
-}
-
-// --- Tavily search (optional) ---------------------------------------------
-
-async function tavilySearch(q: string): Promise<Source[]> {
-  const key = process.env.TAVILY_API_KEY;
-  if (!key) return [];
+async function tavilySearch(query: string): Promise<TavilyResult[]> {
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      api_key: key,
-      query: q,
-      search_depth: "basic",
-      include_domains: [],
-      max_results: 5,
+      api_key: TAVILY_KEY,
+      query,
+      search_depth: "advanced",
+      max_results: 6,
+      include_answer: false,
+      include_images: false,
+      include_domains: [], // leave empty for open web
     }),
+    // avoid Vercel caching
+    next: { revalidate: 0 },
   });
-  if (!res.ok) return [];
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error("Tavily error:", res.status, text);
+    return [];
+  }
+
   const json = await res.json();
-  const items = (json?.results || []) as any[];
-  return items.map((r) => ({
-    title: r.title || r.url,
-    url: r.url,
-    snippet: r.content || "",
-  }));
+  // Tavily returns results under `results` (each has url,title,content)
+  return Array.isArray(json.results) ? json.results.slice(0, 6) : [];
 }
 
-// --- Gemini call -----------------------------------------------------------
-
 async function askGemini(prompt: string): Promise<string> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("Missing GEMINI_API_KEY");
-
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=" +
-    key;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -84,55 +43,92 @@ async function askGemini(prompt: string): Promise<string> {
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        topK: 40,
-        maxOutputTokens: 800,
+        temperature: 0.3,
+        maxOutputTokens: 900,
       },
     }),
   });
 
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Gemini error: ${t}`);
-  }
-
   const json = await res.json();
   const text =
-    json?.candidates?.[0]?.content?.parts?.[0]?.text?.toString() || "";
+    json?.candidates?.[0]?.content?.parts?.[0]?.text ??
+    json?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("\n") ??
+    "";
   return text;
 }
 
-// --- Route handler ---------------------------------------------------------
+function buildPrompt(q: string, sources: TavilyResult[]) {
+  const citationLines = sources
+    .map((s, i) => `[${i + 1}] ${s.title} — ${s.url}`)
+    .join("\n");
+
+  return `
+You're an assistant for Indian medical trainees (MBBS/PG) and clinicians.
+Write a concise, structured answer for the question below.
+Use bullet points and **bold** section labels. Include numeric citations like [1], [2] that refer to the source list provided. 
+If the query looks like ortho/trauma, include sections:
+- Classification
+- Risk Factors
+- Associated Injuries
+- Initial Management
+- Definitive/Follow-up
+Otherwise adapt sensible sections for the specialty (e.g., radiology reporting tips, differentials, red flags).
+
+Be terse, clinically useful, and avoid speculation.
+
+Question:
+${q}
+
+Sources (use these for citations):
+${citationLines}
+`;
+}
+
+function extractBullets(markdown: string): string[] {
+  // Split on lines that look like bullets and keep non-empty
+  const lines = markdown.split(/\r?\n/);
+  const bullets: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^[-*•]\s+/.test(t)) bullets.push(t.replace(/^[-*•]\s+/, ""));
+  }
+  // if no explicit bullets, fallback to paragraphs
+  if (bullets.length === 0) {
+    const paras = markdown
+      .split(/\n\n+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    return paras;
+  }
+  return bullets;
+}
 
 export async function POST(req: Request) {
   try {
-    const { question } = (await req.json()) as { question?: string };
-    if (!question || !question.trim()) {
-      return new Response(
-        JSON.stringify({ error: "Question is required" }),
-        { status: 400, headers: { "Content-Type": "application/json" } }
-      );
-    }
+    const { question } = await req.json().catch(() => ({}));
+    const q = (question || "").toString().trim();
+    if (!q) return NextResponse.json({ error: "Missing question" }, { status: 400 });
 
-    // 1) optional web search
-    const sources = await tavilySearch(question);
+    // 1) Web search
+    const sources = TAVILY_KEY ? await tavilySearch(q) : [];
 
-    // 2) build prompt + ask LLM
-    const prompt = buildPrompt(question, sources);
-    const raw = await askGemini(prompt);
+    // 2) Ask Gemini with sources for citations
+    const prompt = buildPrompt(q, sources);
+    const text = await askGemini(prompt);
 
-    // 3) normalize to bullets
-    const bullets = toBullets(raw);
+    // 3) Return bullets + sources (title/url only)
+    const bullets = extractBullets(text);
+    const minimalSources = sources.map(({ title, url }) => ({ title, url }));
 
-    return new Response(JSON.stringify({ bullets, sources }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+    return NextResponse.json({
+      ok: true,
+      question: q,
+      bullets,
+      sources: minimalSources,
+      raw: text, // handy for debugging, keep for now
     });
   } catch (e: any) {
-    return new Response(
-      JSON.stringify({ error: e?.message || "Server error" }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    console.error("answer route error:", e?.message || e);
+    return NextResponse.json({ ok: false, error: "Server error" }, { status: 500 });
   }
 }
