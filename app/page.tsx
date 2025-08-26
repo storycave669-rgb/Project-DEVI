@@ -3,8 +3,14 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 type Mode = "radiology" | "emergency" | "ortho";
-type Source = { id: number; title: string; url: string };
-type ApiResp = { answer: string; sources: Source[]; mode?: Mode; error?: string };
+type Source = { id: number; title: string; url: string; preview?: string };
+type ApiResp = {
+  answer: string;
+  sources: Source[];
+  mode?: Mode;
+  confidence?: { band: "High" | "Moderate" | "Preliminary"; pct: number };
+  error?: string;
+};
 
 type HistoryItem = {
   id: string;
@@ -17,25 +23,24 @@ type HistoryItem = {
 
 const MAX_HISTORY = 10;
 
-function defaultFollowUps(mode: Mode | "auto" | undefined, q: string): string[] {
-  const s = (mode ?? "auto");
+function defaultFollowUps(mode: Mode | "auto" | undefined): string[] {
+  const s = mode ?? "auto";
   if (s === "radiology") {
     return [
-      "What are the classic signs and measurements to report?",
-      "Give a one-line impression including urgency/next step.",
-      "Top differentials and how to distinguish them?",
+      "Key signs and measurements to report?",
+      "Give a one-line impression with urgency/next step.",
+      "Top differentials and how to distinguish?",
       "Report template (Indication, Technique, Findings, Impression)?",
     ];
   }
   if (s === "emergency") {
     return [
       "Immediate red flags and resus indications?",
-      "Stepwise ABCDE with drug/dose examples?",
-      "When to reduce/splint and when to call ortho?",
+      "ABCDE steps with examples (drugs/doses)?",
+      "When to reduce/splint and call ortho?",
       "Disposition criteria and review window?",
     ];
   }
-  // ortho default
   return [
     "Full classification with radiographic criteria?",
     "Nerve/artery injuries to document and follow?",
@@ -51,9 +56,9 @@ export default function Home() {
   const [html, setHtml] = useState("");
   const [sources, setSources] = useState<Source[]>([]);
   const [serverMode, setServerMode] = useState<Mode | undefined>();
+  const [confidence, setConfidence] = useState<ApiResp["confidence"]>();
   const [history, setHistory] = useState<HistoryItem[]>([]);
 
-  // load history
   useEffect(() => {
     try {
       const raw = localStorage.getItem("devihist");
@@ -61,7 +66,6 @@ export default function Home() {
     } catch {}
   }, []);
 
-  // save history
   useEffect(() => {
     try {
       localStorage.setItem("devihist", JSON.stringify(history.slice(0, MAX_HISTORY)));
@@ -76,6 +80,7 @@ export default function Home() {
     setHtml("");
     setSources([]);
     setServerMode(undefined);
+    setConfidence(undefined);
 
     const body: any = { question };
     const chosen = override ?? mode;
@@ -96,8 +101,8 @@ export default function Home() {
     setHtml(data.answer || "");
     setSources(data.sources || []);
     setServerMode(data.mode);
+    setConfidence(data.confidence);
 
-    // push to history (front)
     const item: HistoryItem = {
       id: String(Date.now()),
       q: question,
@@ -114,7 +119,7 @@ export default function Home() {
     navigator.clipboard.writeText(plain);
   }
 
-  const followups = useMemo(() => defaultFollowUps(serverMode ?? mode, q), [serverMode, mode, q]);
+  const followups = useMemo(() => defaultFollowUps(serverMode ?? mode), [serverMode, mode]);
 
   return (
     <main style={{ maxWidth: 980, margin: "40px auto", padding: "0 20px" }}>
@@ -128,7 +133,7 @@ export default function Home() {
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Ask a question (e.g., Gartland II supracondylar fracture)…"
+          placeholder="Ask a question (e.g., Gartland II supracondylar humerus fracture)…"
           onKeyDown={(e) => e.key === "Enter" && ask()}
           style={{
             flex: 1,
@@ -177,7 +182,7 @@ export default function Home() {
         </button>
       </div>
 
-      {/* Suggestions */}
+      {/* Follow-up suggestions */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
         {followups.map((f, i) => (
           <button
@@ -216,6 +221,7 @@ export default function Home() {
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
+            gap: 10,
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -229,8 +235,23 @@ export default function Home() {
                   border: "1px solid #e5e7eb",
                   borderRadius: 999,
                 }}
+                title="Template used"
               >
                 Mode: {serverMode}
+              </span>
+            )}
+            {confidence && (
+              <span
+                style={{
+                  fontSize: 12,
+                  padding: "3px 8px",
+                  background: confidence.band === "High" ? "#e8f7ed" : confidence.band === "Moderate" ? "#fff8e6" : "#fdecec",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 999,
+                }}
+                title="Based on source quality & diversity"
+              >
+                Confidence: {confidence.band} ({confidence.pct}%)
               </span>
             )}
           </div>
@@ -261,14 +282,20 @@ export default function Home() {
           )}
         </div>
 
-        {/* Sources */}
+        {/* Sources with hover preview */}
         {!loading && sources.length > 0 && (
           <div style={{ padding: 16, borderTop: "1px solid #f3f4f6" }}>
             <div style={{ fontWeight: 700, marginBottom: 8 }}>Sources</div>
             <ol style={{ margin: 0, paddingLeft: 20 }}>
               {sources.map((s) => (
                 <li key={s.id} style={{ margin: "6px 0" }}>
-                  <a href={s.url} target="_blank" rel="noreferrer" style={{ color: "#0a66c2" }}>
+                  <a
+                    href={s.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={s.preview || s.title}
+                    style={{ color: "#0a66c2" }}
+                  >
                     {s.title}
                   </a>
                 </li>
