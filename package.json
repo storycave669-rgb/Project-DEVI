@@ -1,7 +1,6 @@
 {
   "name": "project-devi",
   "private": true,
-  "type": "module",
   "scripts": {
     "build": "next build",
     "start": "next start",
