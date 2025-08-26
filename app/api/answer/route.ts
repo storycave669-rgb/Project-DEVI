@@ -1,142 +1,194 @@
-import { NextResponse } from "next/server";
+// app/api/answer/route.ts
+import { NextResponse, NextRequest } from "next/server";
+import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 
-// ---- ENV KEYS (set these in Vercel after this step) ----
-const TAVILY_KEY = process.env.TAVILY_API_KEY!;
-const GEMINI_KEY = process.env.GEMINI_API_KEY!;
-const MODEL = "gemini-2.0-flash-exp"; // if not available, switch to "gemini-1.5-flash"
+export const runtime = "nodejs"; // use Node runtime on Vercel
 
-// Tavily live web search
-async function tavilySearch(query: string) {
+// ---------- Types ----------
+type AskBody = {
+  question: string;
+};
+
+type TavilyHit = {
+  title: string;
+  url: string;
+  content?: string;
+};
+
+type TavilyResponse = {
+  results: Array<{
+    title: string;
+    url: string;
+    content?: string;
+    snippet?: string;
+  }>;
+};
+
+type Source = {
+  id: number;
+  title: string;
+  url: string;
+  excerpt: string;
+};
+
+type Synthesis = {
+  bullets: string[];
+  raw: string;
+};
+
+// ---------- Helpers ----------
+function envOrThrow(key: string): string {
+  const v = process.env[key];
+  if (!v) {
+    throw new Error(`Missing environment variable: ${key}`);
+  }
+  return v;
+}
+
+/** Turn a block of text into clean bullet strings. */
+function textToBullets(text: string): string[] {
+  const bullets: string[] = text
+    .split("\n")
+    .map((line: string) => line.trim())
+    // lines that start with dash / bullet / numbering become bullets
+    .filter((line: string) => /^([-•]|(\d+[\.\)]))\s+/.test(line))
+    .map((line: string) => line.replace(/^([-•]|(\d+[\.\)]))\s+/, ""));
+
+  // Fallback: if no markdown-style bullets detected, split into sentences
+  if (bullets.length === 0) {
+    return text
+      .split(/(?<=[.!?])\s+/)
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0)
+      .slice(0, 10);
+  }
+  return bullets.slice(0, 10);
+}
+
+/** Fetch sources from Tavily. */
+async function fetchSources(query: string): Promise<Source[]> {
+  const apiKey = envOrThrow("TAVILY_API_KEY");
+
   const res = await fetch("https://api.tavily.com/search", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+    },
+    // Keep this light; adjust knobs later
     body: JSON.stringify({
-      api_key: TAVILY_KEY,
+      api_key: apiKey,
       query,
-      search_depth: "advanced",
       include_answer: false,
       include_images: false,
-      include_raw_content: false,
-      max_results: 8
-    })
+      max_results: 5,
+      search_depth: "basic",
+    }),
   });
-  if (!res.ok) throw new Error(`Tavily HTTP ${res.status}`);
-  const data = await res.json();
-  const results = (data.results || []).map((r: any, i: number) => ({
-    id: i + 1,
-    title: r.title,
-    url: r.url,
-    snippet: (r.content || "").slice(0, 500)
-  }));
-  return results;
-}
 
-// Hidden/system-style prompt
-function buildPrompt(question: string, sources: {id:number;title:string;url:string;snippet:string}[]) {
-  const srcBlock = sources.map(s =>
-    `Source [${s.id}]: ${s.title}\nURL: ${s.url}\nSnippet: ${s.snippet}`
-  ).join("\n\n");
-
-  return `
-You are a clinical Q&A assistant for orthopedics, radiology, and emergency medicine in India.
-Answer with concise, clinically useful bullets and numeric inline citations.
-
-ROUTING:
-- If fractures/orthopedics terms → ORTHO template
-- If imaging/reporting terms (x-ray, CT, MRI, ultrasound) → RADIOLOGY template
-- If ED/triage/resus → EMERGENCY template
-- If ambiguous, choose the closest.
-
-TEMPLATES (pick ONE):
-ORTHO (5–8 bullets):
-• Classification: ...
-• Risks/Complications: ...
-• Red flags: ...
-• Associated injuries: ...
-• Management (initial + definitive): ...
-
-RADIOLOGY (5–8 bullets):
-• Key imaging findings: ...
-• Differential diagnosis: ...
-• Reporting checklist (brief): ...
-• Pitfalls/when to escalate: ...
-• Recommendation (modality/follow-up): ...
-
-EMERGENCY (5–8 bullets):
-• Initial assessment (triage red flags): ...
-• Immediate actions/stabilization: ...
-• Imaging and labs: ...
-• Disposition & consults: ...
-• Pitfalls/common misses: ...
-
-RULES:
-- Use ONLY the sources below for facts; if evidence is weak/contradictory, say so briefly.
-- EVERY bullet must start with "• " and end with inline numeric citations like [1] or [1,3] mapping to the numbered source list order.
-- Be India-aware when relevant (practical, resource-aware tips).
-- No extra headings like “Evidence-based”.
-
-SOURCES (cite with [n]):
-${srcBlock}
-
-USER QUESTION: "${question}"
-
-Return bullets only.
-`.trim();
-}
-
-export async function POST(req: Request) {
-  try {
-    const { q } = await req.json();
-    const question = (q || "").trim();
-    if (!question || question.length < 6) {
-      return NextResponse.json({ error: "Ask a clear medical question (6+ chars)" }, { status: 400 });
-    }
-    if (!TAVILY_KEY || !GEMINI_KEY) {
-      return NextResponse.json({ error: "Server missing API keys" }, { status: 500 });
-    }
-
-    // 1) Live search
-    const sources = await tavilySearch(
-      question + " fracture OR radiology OR emergency medicine site:gov OR site:edu"
-    );
-
-    // 2) Build prompt for Gemini
-    const prompt = buildPrompt(question, sources);
-
-    // 3) Call Gemini (server-side)
-    const r = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent?key=" + GEMINI_KEY,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      }
-    );
-
-    if (!r.ok) {
-      const txt = await r.text();
-      return NextResponse.json({ error: "Gemini failed", details: txt }, { status: 502 });
-    }
-
-    const j = await r.json();
-    const text = j?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-    // 4) Parse bullets (lines starting with • or -)
-    const bullets = text
-      .split("\n")
-      .map(l => l.trim())
-      .filter(l => /^[-•]\s+/.test(l))
-      .map(l => l.replace(/^[-•]\s+/, ""));
-
-    return NextResponse.json({
-      bullets: bullets.length ? bullets : [text || "No structured answer produced."],
-      sources
-    });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message || "Server error" }, { status: 500 });
+  if (!res.ok) {
+    throw new Error(`Tavily error: ${res.status} ${res.statusText}`);
   }
+
+  const data = (await res.json()) as TavilyResponse;
+
+  const hits: TavilyHit[] = data.results?.map((r) => ({
+    title: r.title ?? "Untitled",
+    url: r.url,
+    content: r.content ?? r.snippet ?? "",
+  })) ?? [];
+
+  const sources: Source[] = hits.map((h: TavilyHit, idx: number) => ({
+    id: idx + 1,
+    title: h.title,
+    url: h.url,
+    excerpt: (h.content ?? "").slice(0, 220),
+  }));
+
+  return sources;
 }
 
-export async function GET() {
-  return NextResponse.json({ ok: true });
+/** Ask Gemini to synthesize. */
+async function synthesizeWithGemini(
+  model: GenerativeModel,
+  question: string,
+  sources: Source[]
+): Promise<Synthesis> {
+  const citationsList: string = sources
+    .map((s: Source, i: number) => `${i + 1}. ${s.title} — ${s.url}`)
+    .join("\n");
+
+  const prompt = `
+You are a concise medical assistant for exam prep and quick reference.
+Return up to 10 short, actionable bullet points in Markdown bullets.
+Use the user's question and the provided sources. Do not invent citations.
+
+QUESTION:
+"${question}"
+
+SOURCES:
+${citationsList}
+
+FORMAT STRICTLY:
+- Bullet 1
+- Bullet 2
+- ...
+Then a blank line and "Sources:" followed by numeric list:
+[1] Title — URL
+[2] Title — URL
+`;
+
+  const result = await model.generateContent(prompt);
+  const text = (await result.response.text()) ?? "";
+
+  // Split out the "Sources" section if present
+  const main = text.split(/\n\s*Sources:\s*/i)[0] ?? text;
+
+  return {
+    bullets: textToBullets(main),
+    raw: text,
+  };
+}
+
+// ---------- Route ----------
+export async function POST(req: NextRequest) {
+  try {
+    const body = (await req.json()) as AskBody;
+
+    if (!body?.question || typeof body.question !== "string") {
+      return NextResponse.json(
+        { error: "Missing 'question' (string) in request body." },
+        { status: 400 }
+      );
+    }
+
+    // 1) Gather sources
+    const sources = await fetchSources(body.question);
+
+    // 2) Synthesize with Gemini
+    const genAI = new GoogleGenerativeAI(envOrThrow("GEMINI_API_KEY"));
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    const synthesis = await synthesizeWithGemini(model, body.question, sources);
+
+    return NextResponse.json(
+      {
+        ok: true,
+        question: body.question,
+        bullets: synthesis.bullets,
+        raw: synthesis.raw,
+        sources,
+      },
+      { status: 200 }
+    );
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          err instanceof Error ? err.message : "Unknown error in /api/answer",
+      },
+      { status: 500 }
+    );
+  }
 }
