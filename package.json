@@ -1,5 +1,5 @@
 {
-  "name": "project-yck-2",
+  "name": "project-devi",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,9 +8,16 @@
     "dev": "next dev -p 3000"
   },
   "dependencies": {
-    "@google/generative-ai": "0.21.0",
     "next": "14.2.4",
     "react": "18.3.1",
     "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/react": "^18.2.0",
+    "@types/node": "^20.11.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
