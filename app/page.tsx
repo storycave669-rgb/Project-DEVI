@@ -1,112 +1,77 @@
 "use client";
 
-import React, { useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { useState } from "react";
 
-type TavilySource = {
-  id: number;
-  title: string;
-  url: string;
-  excerpt?: string;
-};
-
+type Source = { id: number; title: string; url: string };
 type ApiResponse = {
-  answer: string;
-  sources: TavilySource[];
-  raw?: any;
+  answer: string;              // Markdown with [1], [2] style citations
+  sources: Source[];
   error?: string;
 };
-
-function linkifyCitations(text: string, maxN: number) {
-  // Replace [1], [2] ... with anchors to #src-1 etc.
-  return text.replace(/\[(\d+)\]/g, (_, nStr) => {
-    const n = Number(nStr);
-    if (!Number.isFinite(n) || n < 1 || (maxN && n > maxN)) return `[${nStr}]`;
-    return `<a href="#src-${n}" style="text-decoration:none;"><sup>[${n}]</sup></a>`;
-  });
-}
 
 export default function Page() {
   const [q, setQ] = useState("Gartland type II supracondylar humerus fracture — what should I know?");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [answer, setAnswer] = useState<string>("");
-  const [sources, setSources] = useState<TavilySource[]>([]);
+  const [answerHtml, setAnswerHtml] = useState<string | null>(null);
+  const [sources, setSources] = useState<Source[]>([]);
 
   async function ask() {
     setLoading(true);
     setErr(null);
-    setAnswer("");
+    setAnswerHtml(null);
     setSources([]);
 
     try {
       const r = await fetch("/api/answer", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: q }),
       });
       const data: ApiResponse = await r.json();
+
       if (!r.ok || data.error) {
-        throw new Error(data.error || `HTTP ${r.status}`);
+        throw new Error(data.error || `Request failed (${r.status})`);
       }
 
-      // Linkify in-text [n] citations to the sources list
-      const linked = linkifyCitations(data.answer || "", (data.sources || []).length);
-      setAnswer(linked);
+      setAnswerHtml(data.answer);   // already HTML (not raw markdown)
       setSources(data.sources || []);
     } catch (e: any) {
-      setErr(e?.message || "Something went wrong");
+      setErr(e.message || "Something went wrong.");
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <main style={{ maxWidth: 820, margin: "40px auto", padding: "0 16px" }}>
-      {/* Header */}
-      <header style={{ marginBottom: 24 }}>
-        <h1 style={{ margin: 0, fontSize: 28, letterSpacing: -0.2 }}>Project Devi</h1>
-        <p style={{ margin: "6px 0 0 0", color: "#666" }}>
-          Minimal medical Q&A with live sources.
-        </p>
-      </header>
+    <main style={{ maxWidth: 880, margin: "40px auto", padding: "0 16px" }}>
+      <h1 style={{ margin: 0, fontSize: 36, letterSpacing: -0.5 }}>Project Devi</h1>
+      <p style={{ marginTop: 8, color: "#666" }}>Minimal medical Q&amp;A with live sources.</p>
 
-      {/* Query bar */}
-      <div
-        style={{
-          display: "flex",
-          gap: 10,
-          alignItems: "center",
-          padding: 12,
-          border: "1px solid #e5e7eb",
-          borderRadius: 12,
-          background: "#fff",
-          boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-        }}
-      >
+      <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Ask a medical question…"
           style={{
             flex: 1,
-            fontSize: 16,
-            border: "none",
+            padding: "14px 16px",
+            borderRadius: 12,
+            border: "1px solid #e5e7eb",
             outline: "none",
-            padding: "6px 4px",
-            background: "transparent",
+            fontSize: 16,
           }}
+          onKeyDown={(e) => e.key === "Enter" && ask()}
         />
         <button
           onClick={ask}
-          disabled={loading || !q.trim()}
+          disabled={loading}
           style={{
-            padding: "10px 16px",
-            borderRadius: 10,
-            border: "1px solid #0ea5e9",
-            background: loading ? "#bae6fd" : "#0ea5e9",
-            color: "#fff",
+            padding: "12px 18px",
+            borderRadius: 12,
+            border: "1px solid #111827",
+            background: "#111827",
+            color: "white",
             fontWeight: 600,
             cursor: loading ? "not-allowed" : "pointer",
           }}
@@ -115,89 +80,36 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Error */}
       {err && (
-        <div
-          style={{
-            marginTop: 16,
-            padding: 12,
-            borderRadius: 10,
-            background: "#fef2f2",
-            border: "1px solid #fecaca",
-            color: "#b91c1c",
-          }}
-        >
+        <div style={{ marginTop: 16, padding: 12, border: "1px solid #fecaca", background: "#fef2f2", borderRadius: 12, color: "#991b1b" }}>
           {err}
         </div>
       )}
 
-      {/* Answer */}
-      {answer && (
-        <section
-          style={{
-            marginTop: 24,
-            padding: "18px 20px",
-            borderRadius: 12,
-            background: "#fff",
-            border: "1px solid #e5e7eb",
-          }}
-        >
-          <h2 style={{ marginTop: 0, fontSize: 20 }}>Answer</h2>
+      {answerHtml && (
+        <section style={{ marginTop: 22, padding: 18, border: "1px solid #e5e7eb", borderRadius: 16, background: "white" }}>
+          <h2 style={{ marginTop: 0 }}>Answer</h2>
 
-          {/* Render Markdown cleanly; allow our linkified [n] with HTML */}
-          <div style={{ lineHeight: 1.6, fontSize: 16 }}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                strong: ({ children }) => (
-                  <strong style={{ fontWeight: 700 }}>{children}</strong>
-                ),
-                li: ({ children }) => <li style={{ margin: "6px 0" }}>{children}</li>,
-                p: ({ children }) => <p style={{ margin: "10px 0" }}>{children}</p>,
-                h3: ({ children }) => (
-                  <h3 style={{ fontSize: 18, margin: "16px 0 8px 0" }}>{children}</h3>
-                ),
-              }}
-            >
-              {/* We allow a tiny snippet of HTML for the linked citations */}
-              {answer}
-            </ReactMarkdown>
-          </div>
-        </section>
-      )}
+          {/* Render preformatted HTML from API (already safe/cleaned there) */}
+          <div
+            style={{ lineHeight: 1.6, fontSize: 16 }}
+            dangerouslySetInnerHTML={{ __html: answerHtml }}
+          />
 
-      {/* Sources */}
-      {sources.length > 0 && (
-        <section
-          style={{
-            marginTop: 16,
-            padding: "18px 20px",
-            borderRadius: 12,
-            background: "#fff",
-            border: "1px solid #e5e7eb",
-          }}
-        >
-          <h3 style={{ marginTop: 0, fontSize: 18 }}>Sources</h3>
-          <ol style={{ paddingLeft: 18, margin: 0 }}>
-            {sources.map((s) => (
-              <li key={s.id} id={`src-${s.id}`} style={{ margin: "8px 0" }}>
-                <a
-                  href={s.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{ color: "#0ea5e9", textDecoration: "underline" }}
-                  title={s.url}
-                >
-                  {s.title}
-                </a>
-                {s.excerpt ? (
-                  <div style={{ color: "#6b7280", fontSize: 14, marginTop: 4 }}>
-                    {s.excerpt}
-                  </div>
-                ) : null}
-              </li>
-            ))}
-          </ol>
+          {sources?.length > 0 && (
+            <>
+              <h3 style={{ marginTop: 22 }}>Sources</h3>
+              <ol style={{ paddingLeft: 18, marginTop: 8 }}>
+                {sources.map((s) => (
+                  <li key={s.id} style={{ marginBottom: 8 }}>
+                    <a href={s.url} target="_blank" rel="noreferrer" style={{ color: "#0ea5e9", textDecoration: "underline" }}>
+                      {s.title}
+                    </a>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
         </section>
       )}
     </main>
