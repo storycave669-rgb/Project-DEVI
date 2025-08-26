@@ -1,13 +1,20 @@
+// app/api/answer/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// ---------- Types ----------
 type TavilyItem = { url: string; title?: string; content?: string };
 type TavilyResp = { results?: TavilyItem[] };
 
-const TAVILY_KEY = process.env.TAVILY_API_KEY!;
-const GEMINI_KEY = process.env.GEMINI_API_KEY!;
+type Bullet = { text: string; cites: number[] };
+type Section = { title: string; bullets: Bullet[] };
+type LlmJson = { summary?: string; sections: Section[] };
 
-// -------- Tavily search -----------------------------------------------------
+// ---------- Env ----------
+const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
+const GEMINI_KEY = process.env.GEMINI_API_KEY || "";
+
+// ---------- Search ----------
 async function webSearch(q: string): Promise<TavilyItem[]> {
   if (!TAVILY_KEY) return [];
   const r = await fetch("https://api.tavily.com/search", {
@@ -18,49 +25,61 @@ async function webSearch(q: string): Promise<TavilyItem[]> {
       query: q,
       search_depth: "advanced",
       include_answer: false,
-      max_results: 6,
+      max_results: 8,
     }),
-    // Vercel fetch defaults are fine; no need to set cache here.
   });
   if (!r.ok) return [];
   const data: TavilyResp = await r.json();
   return data.results ?? [];
 }
 
-// -------- Utils for HTML ----------------------------------------------------
-function ul(items: string[]) {
-  return `<ul style="margin:6px 0 0; padding-left: 20px">${items.map(i => `<li>${i}</li>`).join("")}</ul>`;
-}
-function sec(title: string, items: string[]) {
-  if (!items.length) return "";
-  return `<div style="margin-bottom:14px"><div style="font-weight:700">${title}</div>${ul(items)}</div>`;
+function dedupeByUrl(items: TavilyItem[]) {
+  const seen = new Set<string>();
+  const out: TavilyItem[] = [];
+  for (const it of items) {
+    const key = (it.url || "").replace(/[#?].*$/, "");
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(it);
+    }
+  }
+  return out;
 }
 
-// -------- Intent detection + section sets -----------------------------------
+// ---------- HTML helpers ----------
+function li(s: string) {
+  return `<li>${s}</li>`;
+}
+function ul(items: string[]) {
+  return `<ul>${items.map(li).join("")}</ul>`;
+}
+function sectionBlock(title: string, items: string[]) {
+  if (!items.length) return "";
+  return `<div style="margin:14px 0">
+  <div style="font-weight:700">${title}</div>
+  ${ul(items)}
+</div>`;
+}
+
+// ---------- Mode detection ----------
 type Mode = "radiology" | "emergency" | "ortho";
 
 function detectMode(q: string): Mode {
   const s = q.toLowerCase();
-
-  const radioHits = [
-    "xray", "x-ray", "xr", "radiograph", "ap view", "lateral view",
-    "ct", "computed tomography", "mri", "mr imaging",
-    "ultrasound", "usg", "report", "impression", "ddx", "differential",
-    "findings", "radiology", "slice", "contrast", "sequence", "t1", "t2", "stir"
+  const radio = [
+    "xray","x-ray","radiograph","ap view","lateral view","ct","computed tomography",
+    "mri","ultrasound","usg","report","impression","findings","radiology","sequence"
   ].some(k => s.includes(k));
-
-  const edHits = [
-    "ed ", " emergency", "triage", "resus", "resuscitation", "abcde",
-    "primary survey", "secondary survey", "hypotension", "unstable", "shock",
-    "er approach", "initial stabilization"
+  const ed = [
+    "er "," ed ","emergency","abcde","triage","resuscitation","resus","shock",
+    "unstable","primary survey","secondary survey"
   ].some(k => s.includes(k));
-
-  if (radioHits && !edHits) return "radiology";
-  if (edHits) return "emergency";
+  if (radio && !ed) return "radiology";
+  if (ed) return "emergency";
   return "ortho";
 }
 
-function sectionTitlesFor(mode: Mode): string[] {
+function titlesFor(mode: Mode): string[] {
   if (mode === "radiology") {
     return [
       "Clinical Question",
@@ -79,7 +98,6 @@ function sectionTitlesFor(mode: Mode): string[] {
       "Disposition/Follow-up",
     ];
   }
-  // Ortho default
   return [
     "Classification",
     "Risk Factors",
@@ -89,7 +107,36 @@ function sectionTitlesFor(mode: Mode): string[] {
   ];
 }
 
-// -------- Main handler ------------------------------------------------------
+// ---------- Confidence scoring ----------
+function sourceScore(url: string) {
+  const u = url.toLowerCase();
+  if (/\b(ncbi\.nlm\.nih\.gov|nih\.gov|who\.int|nice\.org|escardio|rcem|acep|uptodate)\b/.test(u)) return 3;
+  if (/\b(pubmed|pmc|radiopaedia|radswiki|radiology|nature|bmj|nejm|thelancet|emcrit|emdocs)\b/.test(u)) return 2;
+  return 1;
+}
+function confidenceLabel(urls: string[]) {
+  const total = urls.length;
+  const score = urls.reduce((s, u) => s + sourceScore(u), 0);
+  const pct = Math.min(100, Math.round((score / Math.max(1, total * 3)) * 100));
+  const band = pct >= 70 ? "High" : pct >= 45 ? "Moderate" : "Preliminary";
+  return { band, pct };
+}
+
+// ---------- JSON extraction ----------
+function extractJson(text: string): LlmJson | null {
+  // remove code fences if present
+  let t = text.replace(/```+json/gi, "```").replace(/```+/g, "").trim();
+  // try direct parse
+  try { return JSON.parse(t) as LlmJson; } catch {}
+  // fallback: grab the first {...} block
+  const m = t.match(/\{[\s\S]*\}$/);
+  if (m) {
+    try { return JSON.parse(m[0]) as LlmJson; } catch {}
+  }
+  return null;
+}
+
+// ---------- Main handler ----------
 export async function POST(req: NextRequest) {
   try {
     const { question } = (await req.json()) as { question: string };
@@ -98,140 +145,179 @@ export async function POST(req: NextRequest) {
     }
 
     const mode = detectMode(question);
-    const titles = sectionTitlesFor(mode);
+    const titles = titlesFor(mode);
 
-    // 1) Live search
-    const hits = await webSearch(question);
+    // 1) live search
+    const hits = dedupeByUrl(await webSearch(question)).slice(0, 6);
     const sources = hits.map((h, i) => ({
       id: i + 1,
       title: h.title || h.url.replace(/^https?:\/\//, ""),
       url: h.url,
       content: (h.content || "").slice(0, 1200),
     }));
-
-    if (sources.length === 0) {
-      const html = `<div>No reliable sources found for this query. Please rephrase or try a more specific question.</div>`;
-      return NextResponse.json({ answer: html, sources: [] }, { status: 200 });
+    if (!sources.length) {
+      const empty = sectionBlock("No Sources", [
+        "No reliable sources found. Try rephrasing the question or adding specifics.",
+      ]);
+      return NextResponse.json({ answer: empty, sources: [], mode, confidence: { band: "Preliminary", pct: 10 } });
     }
 
-    // 2) Build numbered context for Gemini
-    const numberedContext = sources
+    // Numbered context for grounded generation
+    const numbered = sources
       .map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`)
       .join("\n\n");
 
-    const modeHint =
+    const styleHint =
       mode === "radiology"
-        ? "RADIology style for Indian medical students/junior residents. Focus on imaging findings, differentials, and an exam-ready impression."
+        ? "RADIOL0GY teaching style. Concise, exam-ready, specific imaging language."
         : mode === "emergency"
-        ? "EMERGENCY MEDICINE style for Indian medical students/junior residents. Focus on triage, stabilization, immediate management, and dispo."
-        : "ORTHO/TRAUMA style for Indian medical students/junior residents. Focus on classification and stepwise management.";
+        ? "EMERGENCY medicine style. Actionable, ABCDE-first, disposition-oriented."
+        : "ORTHOPAEDICS/TRAUMA style. Classification + stepwise management.";
 
-    const sectionList = titles.map((t, i) => `${i + 1}) ${t}`).join("\n");
+    // 2) Force JSON with exact sections and 3–6 bullets each
+    const prompt = `
+You are a clinical summarizer for Indian medical students/junior residents.
+Use ONLY the SOURCES below (numbered). Do NOT invent facts.
 
-    const systemPrompt = `
-You are a clinical summarizer. Use ONLY the provided sources. If a fact is absent, omit it. Never invent.
-Write for ${modeHint}
+RETURN STRICT JSON (no markdown, no commentary) matching this TypeScript type:
+{
+  "summary": string,         // 1–2 lines: top takeaways
+  "sections": [
+    { "title": string, "bullets": [ { "text": string, "cites": number[] } ] }
+  ]
+}
 
-TASK: For the user's question, produce concise, high-yield bullets under these sections:
-${sectionList}
+RULES:
+- Titles must be EXACTLY these, in order:
+  ${titles.map(t => `- ${t}`).join("\n  ")}
+- 3–6 bullets per section.
+- Each bullet must end with bracketed numeric citations drawn ONLY from the SOURCES list (e.g., "[1]" or "[2,5]").
+- Be specific and confident; avoid hedging. Prefer guideline/review facts.
+- No HTML, no markdown, no code fences, no extra fields.
 
-STRICT RULES:
-- Each bullet must end with inline numeric citations like [1] or [2, 5], matching the source numbers below.
-- Cite ONLY the numbers from the provided SOURCES (no external).
-- Keep each bullet short and practical. Avoid fluff.
-- Output VALID HTML: for each section, render:
-  <div style="font-weight:700">Section Title</div>
-  <ul><li>bullet [n]</li>...</ul>
-- No preamble, no conclusion, no "Sources" list (the server will add links).
+STYLE: ${styleHint}
 
-SOURCES:
-${numberedContext}
+USER QUESTION:
+${question}
+
+SOURCES (numbered):
+${numbered}
 `.trim();
 
-    // 3) Call Gemini
     let htmlAnswer = "";
+    let conf = { band: "Preliminary", pct: 25 };
+
     if (GEMINI_KEY) {
       try {
         const genAI = new GoogleGenerativeAI(GEMINI_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        // Use simple string form to keep TS happy
+        const resp = await model.generateContent(prompt);
+        const raw = (await resp.response.text()).trim();
+        const data = extractJson(raw);
 
-        // ✅ Pass a single string input — avoids the 'role' typing error
-        const result = await model.generateContent(
-        `Question: ${question}\n\n${systemPrompt}`
-        );
-
-        const text = result.response.text().trim();
-
-        // If model already returned valid HTML with our <div> titles, use it.
-        const looksHtml = /<div[^>]*>.*<\/div>/is.test(text) || /<ul>/.test(text);
-        if (looksHtml) {
-          htmlAnswer = text;
-        } else {
-          // Minimal transformation (fallback)
-          const blocks = text.split(/\n{2,}/).map(b => b.trim()).filter(Boolean);
-          const mkBullets = (body: string) =>
-            body
-              .split(/\n|\r/)
-              .map(l => l.replace(/^\s*[-*•]\s*/, "").trim())
+        if (data && Array.isArray(data.sections)) {
+          // Build HTML deterministically from JSON
+          const blocks = data.sections.map(sec => {
+            // enforce allowed titles and non-empty bullets
+            if (!titles.includes(sec.title)) return "";
+            const items = (sec.bullets || [])
+              .slice(0, 8)
+              .map(b => {
+                const cites = (b.cites || []).map(n => String(n)).join(", ");
+                const txt = (b.text || "").replace(/\s*\d+(?:,\s*\d+)*$/,""); // avoid double cite
+                return `${txt} [${cites}]`;
+              })
               .filter(Boolean);
-
-          type S = { title: string; items: string[] };
-          const acc: S[] = titles.map(t => ({ title: t, items: [] }));
-
-          blocks.forEach(b => {
-            for (const sec of acc) {
-              const regex = new RegExp(`^\\s*(?:<b>)?${sec.title}[:：]?(?:</b>)?\\s*`, "i");
-              if (regex.test(b)) {
-                const body = b.replace(regex, "").trim();
-                sec.items.push(...mkBullets(body));
-                return;
-              }
-            }
+            return sectionBlock(sec.title, items);
           });
 
-          const any = acc.some(s => s.items.length);
-          if (any) {
-            htmlAnswer = acc.map(s => sec(s.title, s.items)).join("");
-          } else {
-            // Last-ditch: put the raw text in a single section
-            htmlAnswer = sec(titles[0], text.split(/\n+/).slice(0, 8));
-          }
+          const summaryBlock = data.summary
+            ? `<div style="padding:10px 12px;border:1px solid #e6e6e6;border-radius:10px;background:#f8fafc;margin-top:6px;margin-bottom:12px;">
+                 <div style="font-weight:700;margin-bottom:6px;">Top takeaways</div>
+                 ${ul([data.summary])}
+               </div>`
+            : "";
+
+          htmlAnswer = summaryBlock + blocks.join("");
+
+          // confidence from domains/volume
+          conf = confidenceLabel(sources.map(s => s.url));
         }
       } catch {
-        // swallow and use fallback below
+        // fall through to template below
       }
     }
 
-    // 4) Template fallback if LLM failed
+    // 3) Template fallback (guarantee the 5 sections exist)
     if (!htmlAnswer) {
-      const safe = (i: number) => `[${i}]`;
+      const placeholder = (msg: string, cite: number) => `${msg} [${cite}]`;
+      const safe = (i: number) => Math.min(Math.max(i, 1), sources.length);
+
+      const blocks: string[] = [];
       if (mode === "radiology") {
-        htmlAnswer =
-          sec("Clinical Question", [`What the study needs to answer ${safe(1)}.`]) +
-          sec("Key Imaging Findings", [`Primary signs, relevant measurements ${safe(1)}.`]) +
-          sec("Differential Diagnosis", [`Top 2–4 with discriminators ${safe(2)}.`]) +
-          sec("What to Look For", [`Checklists/pitfalls on modality ${safe(3)}.`]) +
-          sec("Suggested Report Impression", [`One-liner impression with urgency/next step ${safe(1)}.`]);
+        blocks.push(
+          sectionBlock("Clinical Question", [placeholder("Define what the study must answer", safe(1))]),
+          sectionBlock("Key Imaging Findings", [
+            placeholder("Primary signs and measurements", safe(1)),
+            placeholder("Ancillary findings that change management", safe(2)),
+            placeholder("Report-worthy complications", safe(3)),
+          ]),
+          sectionBlock("Differential Diagnosis", [
+            placeholder("Top 2–4 with discriminators", safe(2)),
+            placeholder("Mimics to exclude", safe(3)),
+          ]),
+          sectionBlock("What to Look For", [
+            placeholder("Checklist/pitfalls for this modality", safe(4)),
+          ]),
+          sectionBlock("Suggested Report Impression", [
+            placeholder("One-line impression + next step/urgency", safe(1)),
+          ])
+        );
       } else if (mode === "emergency") {
-        htmlAnswer =
-          sec("Triage/Red Flags", [`Airway/breathing/circulation threats ${safe(1)}.`]) +
-          sec("Initial Stabilization", [`ABCDE, analgesia, splint/immobilize as needed ${safe(1)}.`]) +
-          sec("Focused Assessment", [`Neurovascular, mechanism, critical exam points ${safe(2)}.`]) +
-          sec("Immediate Management", [`Analgesia, reduction indications, antibiotics/tetanus when appropriate ${safe(3)}.`]) +
-          sec("Disposition/Follow-up", [`Admit vs discharge with time-bound review ${safe(2)}.`]);
+        blocks.push(
+          sectionBlock("Triage/Red Flags", [
+            placeholder("Immediate threats to life/limb", safe(1)),
+            placeholder("Indicators for resus bay", safe(2)),
+          ]),
+          sectionBlock("Initial Stabilization", [
+            placeholder("ABCDE priorities", safe(1)),
+            placeholder("Analgesia + immediate procedural needs", safe(2)),
+          ]),
+          sectionBlock("Focused Assessment", [
+            placeholder("Key exam tests and monitoring", safe(3)),
+          ]),
+          sectionBlock("Immediate Management", [
+            placeholder("Drugs/fluids/interventions with indications", safe(3)),
+          ]),
+          sectionBlock("Disposition/Follow-up", [
+            placeholder("Admit vs discharge + review window", safe(2)),
+          ])
+        );
       } else {
-        htmlAnswer =
-          sec("Classification", [`Key type(s) & radiographic features ${safe(1)}.`]) +
-          sec("Risk Factors", [`Mechanism, age, typical context in India ${safe(2)}.`]) +
-          sec("Associated Injuries", [`Nerve/artery risks; what to document ${safe(3)}.`]) +
-          sec("Initial Management", [`ABCDE, analgesia, immobilization, ortho consult ${safe(1)}.`]) +
-          sec("Definitive/Follow-up", [`Indications for reduction/pinning; rehab; follow-up ${safe(2)}.`]);
+        blocks.push(
+          sectionBlock("Classification", [
+            placeholder("Named system with criteria", safe(1)),
+          ]),
+          sectionBlock("Risk Factors", [
+            placeholder("Mechanism/age pattern", safe(2)),
+          ]),
+          sectionBlock("Associated Injuries", [
+            placeholder("Nerve/artery injuries to check", safe(3)),
+          ]),
+          sectionBlock("Initial Management", [
+            placeholder("Analgesia, immobilization, consults", safe(1)),
+          ]),
+          sectionBlock("Definitive/Follow-up", [
+            placeholder("When to reduce/pin; rehab & review", safe(2)),
+          ])
+        );
       }
+      htmlAnswer = blocks.join("");
     }
 
-    // 5) Return
     const publicSources = sources.map(({ id, title, url }) => ({ id, title, url }));
-    return NextResponse.json({ answer: htmlAnswer, sources: publicSources, mode }, { status: 200 });
+    return NextResponse.json({ answer: htmlAnswer, sources: publicSources, mode, confidence: conf }, { status: 200 });
   } catch (e: any) {
     return NextResponse.json({ error: e.message || "Server error." }, { status: 500 });
   }
