@@ -2,75 +2,93 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-export const runtime = "nodejs";
-
-// ---------- Types ----------
+/* ------------------------- Types ------------------------- */
 type TavilyItem = { url: string; title?: string; content?: string };
 type TavilyResp = { results?: TavilyItem[] };
 
 type Mode = "radiology" | "emergency" | "ortho";
 
-// ---------- Env ----------
+/* --------------------- Environment ----------------------- */
 const TAVILY_KEY = process.env.TAVILY_API_KEY || "";
 const GEMINI_KEY = process.env.GEMINI_API_KEY || "";
 
-// ---------- Search ----------
+/* ---------------------- Web Search ----------------------- */
 async function webSearch(q: string): Promise<TavilyItem[]> {
   if (!TAVILY_KEY) return [];
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      api_key: TAVILY_KEY,
-      query: q,
-      search_depth: "advanced",
-      include_answer: false,
-      max_results: 10,
-      include_domains: [
-        "pubmed.ncbi.nlm.nih.gov",
-        "radiopaedia.org",
-        "orthobullets.com",
-        "ncbi.nlm.nih.gov",
-        "aiims.edu",
-        "icmr.gov.in",
-        "nbe.edu.in",
-        "who.int",
-        "uptodate.com"
-      ],
-    }),
-  });
-  if (!r.ok) return [];
-  const data: TavilyResp = await r.json();
-  return data.results ?? [];
-}
-
-function dedupeByUrl(items: TavilyItem[]) {
-  const seen = new Set<string>();
-  const out: TavilyItem[] = [];
-  for (const it of items) {
-    const key = (it.url || "").replace(/[#?].*$/, "");
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(it);
-    }
+  try {
+    const r = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: TAVILY_KEY,
+        query: q,
+        search_depth: "advanced",
+        include_answer: false,
+        max_results: 10,
+        // Nudge toward India-relevant guidance + high quality sources
+        include_domains: [
+          "aiims.edu",
+          "icmr.gov.in",
+          "nbe.edu.in",
+          "mohfw.gov.in",
+          "who.int",
+          "pubmed.ncbi.nlm.nih.gov",
+          "ncbi.nlm.nih.gov",
+          "uptodate.com",
+        ],
+      }),
+    });
+    if (!r.ok) return [];
+    const data: TavilyResp = await r.json();
+    return data.results ?? [];
+  } catch {
+    return [];
   }
-  return out;
 }
 
-// ---------- Mode detection ----------
+/* ----------------- Mode detection & titles --------------- */
 function detectMode(q: string): Mode {
   const s = q.toLowerCase();
-  const radio = [
-    "xray","x-ray","radiograph","ap view","lateral view",
-    "ct","computed tomography","mri","ultrasound","usg",
-    "report","impression","findings","radiology","sequence","t1","t2","stir"
-  ].some(k => s.includes(k));
-  const ed = [
-    " emergency"," er "," ed ","triage","abcde","resus","resuscitation",
-    "shock","unstable","primary survey","secondary survey","trauma bay"
-  ].some(k => s.includes(k));
-  if (radio && !ed) return "radiology";
-  if (ed) return "emergency";
+
+  const radioHits = [
+    "xray",
+    "x-ray",
+    "xr ",
+    "radiograph",
+    "ap view",
+    "lateral view",
+    "ct",
+    "computed tomography",
+    "mri",
+    "mr ",
+    "ultrasound",
+    "usg",
+    "report",
+    "impression",
+    "findings",
+    "sequence",
+    "contrast",
+    "t1",
+    "t2",
+    "stir",
+  ].some((k) => s.includes(k));
+
+  const edHits = [
+    "ed ",
+    " emergency",
+    "triage",
+    "abcde",
+    "primary survey",
+    "secondary survey",
+    "hypotension",
+    "shock",
+    "resus",
+    "resuscitation",
+    "unstable",
+  ].some((k) => s.includes(k));
+
+  if (radioHits && !edHits) return "radiology";
+  if (edHits) return "emergency";
   return "ortho";
 }
 
@@ -93,6 +111,7 @@ function sectionTitles(mode: Mode): string[] {
       "Disposition/Follow-up",
     ];
   }
+  // Ortho default
   return [
     "Classification",
     "Risk Factors",
@@ -102,186 +121,330 @@ function sectionTitles(mode: Mode): string[] {
   ];
 }
 
-// ---------- HTML helpers ----------
-function cleanCitations(text: string): string {
-  // [5]. [5] -> [5]
-  return text.replace(/(\d+(?:,\s*\d+)*)(\.\s*\1)+/g, "$1");
-}
-function stripFences(s: string) {
-  return s.replace(/```+(\w+)?/g, "").trim();
-}
-function pruneHtml(html: string) {
-  let out = stripFences(html);
-  // remove "not specified" bullets
-  out = out.replace(/<li>[^<]*not\s+specified[^<]*<\/li>/gi, "");
-  // collapse duplicate cites in bullets
-  out = cleanCitations(out);
-  // drop empty lists
-  out = out.replace(/<ul>\s*<\/ul>/gi, "");
-  // drop section titles with no list after them
-  out = out.replace(
-    /<div[^>]*font-weight:700[^>]*>[^<]*<\/div>\s*(?=<div|$)/gi,
-    ""
-  );
-  return out.trim();
+/* -------------------- HTML helpers ----------------------- */
+function buildHtmlFromJson(
+  titles: string[],
+  data: { sections?: Array<{ title?: string; bullets?: string[] }> }
+) {
+  // Map section title (lowercased) -> bullets
+  const byTitle = new Map<string, string[]>();
+  for (const sec of data.sections || []) {
+    const t = (sec.title || "").trim().toLowerCase();
+    if (!t) continue;
+    const cleaned = (sec.bullets || [])
+      .map((b) => (b || "").trim())
+      .filter(
+        (b) =>
+          b &&
+          !/^this section is not applicable/i.test(b) &&
+          !/^not applicable/i.test(b) &&
+          !/^no information provided/i.test(b)
+      );
+    if (cleaned.length) byTitle.set(t, cleaned);
+  }
+
+  const html: string[] = [];
+  for (const wanted of titles) {
+    const key = wanted.toLowerCase();
+    const bullets = byTitle.get(key) || [];
+    if (!bullets.length) continue; // hide empty sections
+
+    // Deduplicate trailing repeated citations like "[5]. [5]"
+    const items = bullets
+      .map((b) => b.replace(/(\[\d+(?:,\s*\d+)*\])(\.\s*\1)+$/g, "$1"))
+      .map((b) => `<li>${b}</li>`)
+      .join("");
+
+    html.push(
+      `<div style="font-weight:700">${wanted}</div><ul>${items}</ul>`
+    );
+  }
+  return html.join("");
 }
 
-function li(s: string) {
-  return `<li>${cleanCitations(s)}</li>`;
-}
-function ul(items: string[]) {
-  return `<ul>${items.map(li).join("")}</ul>`;
-}
-function sectionBlock(title: string, items: string[]) {
-  if (!items.length) return "";
-  return `<div style="font-weight:700">${title}</div>${ul(items)}`;
+function hardScrub(str: string) {
+  // Remove leaked heading lines or not-applicable bullets if any sneak through
+  return str
+    .replace(/^(?:radiology|emergency|ortho):.*$/gim, "")
+    .replace(
+      /<li>[^<]*(?:not\s+applicable|no information provided)[^<]*<\/li>/gi,
+      ""
+    )
+    .trim();
 }
 
-// ---------- Handler ----------
+/* ----------------------- Handler ------------------------- */
 export async function POST(req: NextRequest) {
   try {
-    const { question } = (await req.json()) as { question?: string };
-    if (!question || question.trim().length < 3) {
-      return NextResponse.json({ error: "Ask a valid question." }, { status: 400 });
+    const body = (await req.json()) as { question?: string; mode?: Mode | "auto" };
+    const question = (body?.question || "").trim();
+    const inputMode = (body?.mode || "auto") as "auto" | Mode;
+
+    if (!question || question.length < 3) {
+      return NextResponse.json(
+        { error: "Ask a valid question." },
+        { status: 400 }
+      );
     }
 
-    const mode = detectMode(question);
+    const mode = inputMode === "auto" ? detectMode(question) : (inputMode as Mode);
     const titles = sectionTitles(mode);
 
-    // 1) Search + sources
-    const hits = dedupeByUrl(await webSearch(question)).slice(0, 8);
+    // 1) Live search
+    const hits = await webSearch(question);
     const sources = hits.map((h, i) => ({
       id: i + 1,
       title: h.title || h.url.replace(/^https?:\/\//, ""),
       url: h.url,
-      content: (h.content || "").slice(0, 1100),
+      content: (h.content || "").slice(0, 1200),
     }));
 
     if (!sources.length) {
-      const html =
-        `<div style="font-weight:700">No reliable sources found</div>` +
-        ul([
-          "Rephrase the question with specifics (age, modality, mechanism).",
-          "Try including a key term (e.g., 'Gartland', 'CT PE', 'ABCDE').",
-        ]);
-      return NextResponse.json({ answer: html, sources: [], mode }, { status: 200 });
+      const html = `<div style="font-style:italic">No reliable sources found for this query. Please rephrase or try a more specific question.</div>`;
+      return NextResponse.json(
+        { answer: html, sources: [], mode },
+        { status: 200 }
+      );
     }
 
-    // 2) Numbered context for citations
+    // 2) Build numbered context for Gemini
     const numberedContext = sources
-      .map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`)
+      .map((s) => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`)
       .join("\n\n");
 
-    // 3) Prompt (JR/consultant style; strict format; assertive tone)
-    const prompt = `
-You are a clinical summarizer for Indian junior residents and consultants.
-Use ONLY the SOURCES (numbered) below. Do NOT invent facts.
+    // 3) JSON-only prompt to prevent template leakage
+    const jsonPrompt = `
+Return ONLY JSON for the user's clinical question, no preface, no code fences.
 
-OUTPUT STRICTLY as VALID HTML sections. EXACTLY these 5 section titles (based on mode):
-- Radiology: Clinical Question, Key Imaging Findings, Differential Diagnosis, What to Look For, Suggested Report Impression
-- Emergency: Triage/Red Flags, Initial Stabilization, Focused Assessment, Immediate Management, Disposition/Follow-up
-- Ortho: Classification, Risk Factors, Associated Injuries, Initial Management, Definitive/Follow-up
+Schema:
+{
+  "sections": [
+    {"title":"${titles[0]}","bullets":["point [1]","point [2]"]},
+    {"title":"${titles[1]}","bullets":["..."]},
+    {"title":"${titles[2]}","bullets":["..."]},
+    {"title":"${titles[3]}","bullets":["..."]},
+    {"title":"${titles[4]}","bullets":["..."]}
+  ]
+}
 
-RULES:
-- 3–6 bullets per section. If sources are thin, include safe, exam-relevant bullets grounded in common guidance.
-- Use confident, guideline-style language. Avoid hedging words: “may”, “often”, “possibly”. Prefer “is indicated”, “is appropriate”.
-- Each bullet ENDS with numeric citations in brackets like [1] or [2,4] that refer ONLY to the source numbers below.
-- NO extra sections (no “Top takeaways”, no intro, no conclusion).
-- HTML pattern per section:
-  <div style="font-weight:700">Section Title</div>
-  <ul><li>bullet [n]</li>...</ul>
-
-PREFER SOURCES:
-- PubMed/NCBI, WHO/ATLS, AIIMS/ICMR/NBE (.gov.in), Radiopaedia, Orthobullets, UpToDate.
+Rules:
+- 3–6 concise, high-yield bullets per section (never fewer than 3 if evidence permits).
+- Use confident, guideline-style language (“is indicated”, “is appropriate”); avoid hedging (“may”, “often”) unless directly quoted by a source.
+- Every bullet ends with numeric citations like [1] or [2,4] that refer ONLY to the provided SOURCES.
+- Prefer guideline/systematic-review content; if evidence is thin, include pragmatic exam-relevant bullets grounded in common guidance.
+- Do NOT write “not applicable”; if thin, give safe, generalizable teaching points with citations.
+- Do NOT include any sections other than the five given titles.
+- Output must be valid JSON. No extra text.
 
 USER QUESTION:
 ${question}
 
 SOURCES (numbered):
 ${numberedContext}
-`.trim();
+    `.trim();
 
-    // 4) Call Gemini
+    // 4) Call Gemini → JSON
     let htmlAnswer = "";
     if (GEMINI_KEY) {
       try {
         const genAI = new GoogleGenerativeAI(GEMINI_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const resp = await model.generateContent(prompt);
-        const raw = await resp.response.text();
-        const cleaned = pruneHtml(raw);
-        const looksHtml = /<div[^>]*font-weight:700[^>]*>/.test(cleaned) && /<ul>/.test(cleaned);
-        if (looksHtml) htmlAnswer = cleaned;
+
+        const resp = await model.generateContent({
+          contents: [{ role: "user", parts: [{ text: jsonPrompt }] }],
+          // Enforce JSON (supported by @google/generative-ai >=0.19)
+          generationConfig: { responseMimeType: "application/json" } as any,
+        });
+
+        // Parse JSON (be defensive if model leaks text)
+        let parsed: any = {};
+        const rawText = await resp.response.text();
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          const m = rawText.match(/\{[\s\S]*\}$/);
+          if (m) parsed = JSON.parse(m[0]);
+        }
+
+        htmlAnswer = buildHtmlFromJson(titles, parsed);
       } catch {
-        // fall through to fallback
+        // fall through to template
       }
     }
 
-    // 5) Fallback (guarantee ≥3 bullets/section)
+    // 5) Fallback template (guarantee 3 bullets/section)
     if (!htmlAnswer) {
-      const safe = (i: number) => `[${Math.min(Math.max(i, 1), sources.length)}]`;
-      const pad3 = (arr: string[], fallback: string[]) =>
-        (arr.length >= 3 ? arr : [...arr, ...fallback].slice(0, 3));
+      const safe = (i: number) => `[${Math.min(i, Math.max(1, sources.length))}]`;
 
       if (mode === "radiology") {
-        htmlAnswer =
-          sectionBlock("Clinical Question", pad3([
-            `Define what the study must answer ${safe(1)}`,
-          ], [`Clinical indication and phase of care ${safe(2)}`, `Relevance to management decision ${safe(3)}`])) +
-          sectionBlock("Key Imaging Findings", pad3([
-            `Primary signs and essential measurements ${safe(1)}`,
-            `Ancillary findings that change management ${safe(2)}`
-          ], [`Complications to report (e.g., malalignment, NV compromise) ${safe(3)}`])) +
-          sectionBlock("Differential Diagnosis", pad3([
-            `Top 2–4 entities with discriminators ${safe(2)}`
-          ], [`Common mimics to exclude ${safe(3)}`, `When advanced imaging is indicated ${safe(4)}`])) +
-          sectionBlock("What to Look For", pad3([
-            `Checklist/pitfalls for this modality ${safe(4)}`
-          ], [`Views/sequences critical for diagnosis ${safe(2)}`, `Compare with prior imaging if available ${safe(1)}`])) +
-          sectionBlock("Suggested Report Impression", pad3([
-            `Concise impression with urgency/next step ${safe(1)}`
-          ], [`Correlation with clinic/labs when needed ${safe(2)}`, `Clear recommendation if management changes ${safe(3)}`]));
+        const blocks = [
+          {
+            t: "Clinical Question",
+            b: [
+              `Summarize the clinical problem and modality/contrast to answer ${safe(1)}.`,
+              `State the key diagnostic goal (rule-in/out, grading, complications) ${safe(1)}.`,
+              `Mention any relevant prior imaging or comparison need ${safe(1)}.`,
+            ],
+          },
+          {
+            t: "Key Imaging Findings",
+            b: [
+              `Primary signs and critical measurements relevant to the diagnosis ${safe(1)}.`,
+              `Complications or associated findings to actively search for ${safe(2)}.`,
+              `Severity features that impact management/disposition ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Differential Diagnosis",
+            b: [
+              `Top 2–4 differentials with discriminators on imaging ${safe(2)}.`,
+              `Briefly note when to escalate imaging (e.g., CT/MRI) ${safe(3)}.`,
+              `Flag mimics/pitfalls to avoid misinterpretation ${safe(2)}.`,
+            ],
+          },
+          {
+            t: "What to Look For",
+            b: [
+              `Checklist for the modality (windowing/planes/measurements) ${safe(1)}.`,
+              `Sites commonly missed and how to systematically review them ${safe(2)}.`,
+              `Reportable incidental but management-changing findings ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Suggested Report Impression",
+            b: [
+              `One-line diagnosis + severity and side/site ${safe(1)}.`,
+              `Complication status and immediate recommended action ${safe(2)}.`,
+              `If equivocal: short recommendation for next best test ${safe(3)}.`,
+            ],
+          },
+        ];
+        htmlAnswer = blocks
+          .map(
+            (blk) =>
+              `<div style="font-weight:700">${blk.t}</div><ul>${blk.b
+                .map((x) => `<li>${x}</li>`)
+                .join("")}</ul>`
+          )
+          .join("");
       } else if (mode === "emergency") {
-        htmlAnswer =
-          sectionBlock("Triage/Red Flags", pad3([
-            `Immediate life/limb threats; activate resus if present ${safe(1)}`
-          ], [`Indications for urgent specialist call ${safe(2)}`, `Early antibiotics/antitetanus where appropriate ${safe(3)}`])) +
-          sectionBlock("Initial Stabilization", pad3([
-            `ABCDE priorities with analgesia ${safe(1)}`
-          ], [`Immobilize/splint as indicated ${safe(2)}`, `Hemodynamic targets and monitoring ${safe(3)}`])) +
-          sectionBlock("Focused Assessment", pad3([
-            `Neurovascular exam and key decision points ${safe(2)}`
-          ], [`Mechanism of injury and risk stratification ${safe(3)}`, `Indications for imaging/labs ${safe(4)}`])) +
-          sectionBlock("Immediate Management", pad3([
-            `Reduction/traction/sedation criteria ${safe(2)}`
-          ], [`Antibiotics/tetanus/anticoagulation where indicated ${safe(3)}`, `Analgesia and compartment checks ${safe(4)}`])) +
-          sectionBlock("Disposition/Follow-up", pad3([
-            `Admit vs discharge criteria with review window ${safe(2)}`
-          ], [`Explicit return precautions ${safe(3)}`, `Documentation essentials ${safe(4)}`]));
+        const blocks = [
+          {
+            t: "Triage/Red Flags",
+            b: [
+              `Immediate threats to airway/breathing/circulation ${safe(1)}.`,
+              `Physiologic triggers for urgent intervention (e.g., hypotension, GCS) ${safe(2)}.`,
+              `High-risk mechanisms or comorbidities that change pathway ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Initial Stabilization",
+            b: [
+              `ABCDE with analgesia and early imaging/POCUS where indicated ${safe(1)}.`,
+              `IV/IO access, resuscitation targets and monitoring ${safe(2)}.`,
+              `Early consult/activation criteria (ortho/trauma/neuro/etc.) ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Focused Assessment",
+            b: [
+              `Key exam maneuvers and neurovascular checks to document ${safe(1)}.`,
+              `Decision points for imaging and labs ${safe(2)}.`,
+              `Screen for associated injuries and complications ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Immediate Management",
+            b: [
+              `Definitive actions (reduction/splint, antibiotics/tetanus where appropriate) ${safe(1)}.`,
+              `Analgesia/sedation strategy and post-procedure checks ${safe(2)}.`,
+              `Escalation criteria for OR/ICU ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Disposition/Follow-up",
+            b: [
+              `Admit vs discharge with clear return precautions ${safe(1)}.`,
+              `Follow-up timing and rehab/weight-bearing advice ${safe(2)}.`,
+              `Documentation pearls (neurovascular status, consent, complications) ${safe(3)}.`,
+            ],
+          },
+        ];
+        htmlAnswer = blocks
+          .map(
+            (blk) =>
+              `<div style="font-weight:700">${blk.t}</div><ul>${blk.b
+                .map((x) => `<li>${x}</li>`)
+                .join("")}</ul>`
+          )
+          .join("");
       } else {
-        // Ortho default
-        htmlAnswer =
-          sectionBlock("Classification", pad3([
-            `Named system with defining criteria ${safe(1)}`
-          ], [`Radiographic features to state ${safe(2)}`, `Instability indicators ${safe(3)}`])) +
-          sectionBlock("Risk Factors", pad3([
-            `Mechanism/age pattern relevant in India ${safe(2)}`
-          ], [`Injury energy and contamination level ${safe(3)}`, `Comorbidities impacting healing ${safe(4)}`])) +
-          sectionBlock("Associated Injuries", pad3([
-            `Nerve injuries to document and follow ${safe(2)}`
-          ], [`Arterial injury risk; pulses/capillary refill ${safe(3)}`, `Compartment syndrome red flags ${safe(4)}`])) +
-          sectionBlock("Initial Management", pad3([
-            `Analgesia, immobilization, and consults ${safe(1)}`
-          ], [`When to reduce urgently ${safe(2)}`, `Imaging views needed before/after reduction ${safe(3)}`])) +
-          sectionBlock("Definitive/Follow-up", pad3([
-            `Indications for fixation vs non-op ${safe(2)}`
-          ], [`Rehab milestones and clinic review ${safe(3)}`, `Document neurovascular status post-treatment ${safe(4)}`]));
+        // Ortho
+        const blocks = [
+          {
+            t: "Classification",
+            b: [
+              `Standard classification and key radiographic features ${safe(1)}.`,
+              `Subtypes relevant for management decisions ${safe(2)}.`,
+              `Stability indicators and prognostic factors ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Risk Factors",
+            b: [
+              `Typical mechanism/age/setting in the Indian context ${safe(1)}.`,
+              `Situations that predict complications or failure of conservative care ${safe(2)}.`,
+              `Red-flag comorbidities that change management ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Associated Injuries",
+            b: [
+              `Nerve and artery risks; how to document and re-check ${safe(1)}.`,
+              `Joint injuries and common fracture companions ${safe(2)}.`,
+              `When to involve other teams early ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Initial Management",
+            b: [
+              `ABCDE, analgesia, immobilization/splinting options ${safe(1)}.`,
+              `Indications for reduction/pinning vs conservative care ${safe(2)}.`,
+              `Imaging follow-up schedule and complications to monitor ${safe(3)}.`,
+            ],
+          },
+          {
+            t: "Definitive/Follow-up",
+            b: [
+              `Operative/non-operative pathways with criteria ${safe(1)}.`,
+              `Rehab milestones and return-to-activity advice ${safe(2)}.`,
+              `When to escalate if alignment/pain/neurovascular worsen ${safe(3)}.`,
+            ],
+          },
+        ];
+        htmlAnswer = blocks
+          .map(
+            (blk) =>
+              `<div style="font-weight:700">${blk.t}</div><ul>${blk.b
+                .map((x) => `<li>${x}</li>`)
+                .join("")}</ul>`
+          )
+          .join("");
       }
     }
 
+    // 6) Final scrub & return
+    htmlAnswer = hardScrub(htmlAnswer);
     const publicSources = sources.map(({ id, title, url }) => ({ id, title, url }));
-    return NextResponse.json({ answer: htmlAnswer, sources: publicSources, mode }, { status: 200 });
+
+    return NextResponse.json(
+      { answer: htmlAnswer, sources: publicSources, mode },
+      { status: 200 }
+    );
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "Server error." }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message || "Server error." },
+      { status: 500 }
+    );
   }
 }
