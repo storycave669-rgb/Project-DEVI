@@ -1,6 +1,6 @@
 export const metadata = {
   title: "Project Devi",
-  description: "Minimal Next.js app",
+  description: "Minimal medical query UI",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
