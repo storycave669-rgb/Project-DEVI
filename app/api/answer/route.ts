@@ -20,7 +20,6 @@ async function webSearch(q: string): Promise<TavilyItem[]> {
       include_answer: false,
       max_results: 6,
     }),
-    // Vercel fetch defaults are fine; no need to set cache here.
   });
   if (!r.ok) return [];
   const data: TavilyResp = await r.json();
@@ -29,11 +28,15 @@ async function webSearch(q: string): Promise<TavilyItem[]> {
 
 // -------- Utils for HTML ----------------------------------------------------
 function ul(items: string[]) {
-  return `<ul style="margin:6px 0 0; padding-left: 20px">${items.map(i => `<li>${i}</li>`).join("")}</ul>`;
+  return `<ul style="margin:6px 0 0; padding-left: 20px">${items
+    .map((i) => `<li>${i}</li>`)
+    .join("")}</ul>`;
 }
 function sec(title: string, items: string[]) {
   if (!items.length) return "";
-  return `<div style="margin-bottom:14px"><div style="font-weight:700">${title}</div>${ul(items)}</div>`;
+  return `<div style="margin-bottom:14px"><div style="font-weight:700">${title}</div>${ul(
+    items
+  )}</div>`;
 }
 
 // -------- Intent detection + section sets -----------------------------------
@@ -43,17 +46,47 @@ function detectMode(q: string): Mode {
   const s = q.toLowerCase();
 
   const radioHits = [
-    "xray", "x-ray", "xr", "radiograph", "ap view", "lateral view",
-    "ct", "computed tomography", "mri", "mr imaging",
-    "ultrasound", "usg", "report", "impression", "ddx", "differential",
-    "findings", "radiology", "slice", "contrast", "sequence", "t1", "t2", "stir"
-  ].some(k => s.includes(k));
+    "xray",
+    "x-ray",
+    "xr",
+    "radiograph",
+    "ap view",
+    "lateral view",
+    "ct",
+    "computed tomography",
+    "mri",
+    "mr imaging",
+    "ultrasound",
+    "usg",
+    "report",
+    "impression",
+    "ddx",
+    "differential",
+    "findings",
+    "radiology",
+    "slice",
+    "contrast",
+    "sequence",
+    "t1",
+    "t2",
+    "stir",
+  ].some((k) => s.includes(k));
 
   const edHits = [
-    "ed ", " emergency", "triage", "resus", "resuscitation", "abcde",
-    "primary survey", "secondary survey", "hypotension", "unstable", "shock",
-    "er approach", "initial stabilization"
-  ].some(k => s.includes(k));
+    "ed ",
+    " emergency",
+    "triage",
+    "resus",
+    "resuscitation",
+    "abcde",
+    "primary survey",
+    "secondary survey",
+    "hypotension",
+    "unstable",
+    "shock",
+    "er approach",
+    "initial stabilization",
+  ].some((k) => s.includes(k));
 
   if (radioHits && !edHits) return "radiology";
   if (edHits) return "emergency";
@@ -94,7 +127,10 @@ export async function POST(req: NextRequest) {
   try {
     const { question } = (await req.json()) as { question: string };
     if (!question || question.trim().length < 3) {
-      return NextResponse.json({ error: "Ask a valid question." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Ask a valid question." },
+        { status: 400 }
+      );
     }
 
     const mode = detectMode(question);
@@ -116,12 +152,14 @@ export async function POST(req: NextRequest) {
 
     // 2) Build numbered context for Gemini
     const numberedContext = sources
-      .map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`)
+      .map(
+        (s) => `[${s.id}] ${s.title}\nURL: ${s.url}\nSNIPPET: ${s.content}`
+      )
       .join("\n\n");
 
     const modeHint =
       mode === "radiology"
-        ? "RADIology style for Indian medical students/junior residents. Focus on imaging findings, differentials, and an exam-ready impression."
+        ? "RADIOLOGY style for Indian medical students/junior residents. Focus on imaging findings, differentials, and an exam-ready impression."
         : mode === "emergency"
         ? "EMERGENCY MEDICINE style for Indian medical students/junior residents. Focus on triage, stabilization, immediate management, and dispo."
         : "ORTHO/TRAUMA style for Indian medical students/junior residents. Focus on classification and stepwise management.";
@@ -148,49 +186,54 @@ SOURCES:
 ${numberedContext}
 `.trim();
 
-    // 3) Call Gemini
+    // 3) Call Gemini (FIXED: pass a single string instead of an object array)
     let htmlAnswer = "";
     if (GEMINI_KEY) {
       try {
         const genAI = new GoogleGenerativeAI(GEMINI_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const result = await model.generateContent([
-          { role: "user", parts: [{ text: `Question: ${question}\n\n${systemPrompt}` }] },
-        ]);
+
+        const prompt = `Question: ${question}\n\n${systemPrompt}`;
+        const result = await model.generateContent(prompt);
         const text = result.response.text().trim();
 
-        // If model already returned valid HTML with our <div> titles, use it.
+        // If model already returned valid HTML, use it directly.
         const looksHtml = /<div[^>]*>.*<\/div>/is.test(text) || /<ul>/.test(text);
         if (looksHtml) {
           htmlAnswer = text;
         } else {
           // Minimal transformation (fallback)
-          const blocks = text.split(/\n{2,}/).map(b => b.trim()).filter(Boolean);
+          const blocks = text
+            .split(/\n{2,}/)
+            .map((b) => b.trim())
+            .filter(Boolean);
           const mkBullets = (body: string) =>
             body
               .split(/\n|\r/)
-              .map(l => l.replace(/^\s*[-*•]\s*/, "").trim())
+              .map((l) => l.replace(/^\s*[-*•]\s*/, "").trim())
               .filter(Boolean);
 
           type S = { title: string; items: string[] };
-          const acc: S[] = titles.map(t => ({ title: t, items: [] }));
+          const acc: S[] = titles.map((t) => ({ title: t, items: [] }));
 
-          blocks.forEach(b => {
-            for (const sec of acc) {
-              const regex = new RegExp(`^\\s*(?:<b>)?${sec.title}[:：]?(?:</b>)?\\s*`, "i");
+          blocks.forEach((b) => {
+            for (const secn of acc) {
+              const regex = new RegExp(
+                `^\\s*(?:<b>)?${secn.title}[:：]?(?:</b>)?\\s*`,
+                "i"
+              );
               if (regex.test(b)) {
                 const body = b.replace(regex, "").trim();
-                sec.items.push(...mkBullets(body));
+                secn.items.push(...mkBullets(body));
                 return;
               }
             }
           });
 
-          const any = acc.some(s => s.items.length);
+          const any = acc.some((s) => s.items.length);
           if (any) {
-            htmlAnswer = acc.map(s => sec(s.title, s.items)).join("");
+            htmlAnswer = acc.map((s) => sec(s.title, s.items)).join("");
           } else {
-            // Last-ditch: put the raw text in a single section
             htmlAnswer = sec(titles[0], text.split(/\n+/).slice(0, 8));
           }
         }
@@ -205,31 +248,67 @@ ${numberedContext}
       if (mode === "radiology") {
         htmlAnswer =
           sec("Clinical Question", [`What the study needs to answer ${safe(1)}.`]) +
-          sec("Key Imaging Findings", [`Primary signs, relevant measurements ${safe(1)}.`]) +
-          sec("Differential Diagnosis", [`Top 2–4 with discriminators ${safe(2)}.`]) +
-          sec("What to Look For", [`Checklists/pitfalls on modality ${safe(3)}.`]) +
-          sec("Suggested Report Impression", [`One-liner impression with urgency/next step ${safe(1)}.`]);
+          sec("Key Imaging Findings", [
+            `Primary signs, relevant measurements ${safe(1)}.`,
+          ]) +
+          sec("Differential Diagnosis", [
+            `Top 2–4 with discriminators ${safe(2)}.`,
+          ]) +
+          sec("What to Look For", [
+            `Checklists/pitfalls on modality ${safe(3)}.`,
+          ]) +
+          sec("Suggested Report Impression", [
+            `One-liner impression with urgency/next step ${safe(1)}.`,
+          ]);
       } else if (mode === "emergency") {
         htmlAnswer =
-          sec("Triage/Red Flags", [`Airway/breathing/circulation threats ${safe(1)}.`]) +
-          sec("Initial Stabilization", [`ABCDE, analgesia, splint/immobilize as needed ${safe(1)}.`]) +
-          sec("Focused Assessment", [`Neurovascular, mechanism, critical exam points ${safe(2)}.`]) +
-          sec("Immediate Management", [`Analgesia, reduction indications, antibiotics/tetanus when appropriate ${safe(3)}.`]) +
-          sec("Disposition/Follow-up", [`Admit vs discharge with time-bound review ${safe(2)}.`]);
+          sec("Triage/Red Flags", [
+            `Airway/breathing/circulation threats ${safe(1)}.`,
+          ]) +
+          sec("Initial Stabilization", [
+            `ABCDE, analgesia, splint/immobilize as needed ${safe(1)}.`,
+          ]) +
+          sec("Focused Assessment", [
+            `Neurovascular, mechanism, critical exam points ${safe(2)}.`,
+          ]) +
+          sec("Immediate Management", [
+            `Analgesia, reduction indications, antibiotics/tetanus when appropriate ${safe(3)}.`,
+          ]) +
+          sec("Disposition/Follow-up", [
+            `Admit vs discharge with time-bound review ${safe(2)}.`,
+          ]);
       } else {
         htmlAnswer =
-          sec("Classification", [`Key type(s) & radiographic features ${safe(1)}.`]) +
+          sec("Classification", [
+            `Key type(s) & radiographic features ${safe(1)}.`,
+          ]) +
           sec("Risk Factors", [`Mechanism, age, typical context in India ${safe(2)}.`]) +
-          sec("Associated Injuries", [`Nerve/artery risks; what to document ${safe(3)}.`]) +
-          sec("Initial Management", [`ABCDE, analgesia, immobilization, ortho consult ${safe(1)}.`]) +
-          sec("Definitive/Follow-up", [`Indications for reduction/pinning; rehab; follow-up ${safe(2)}.`]);
+          sec("Associated Injuries", [
+            `Nerve/artery risks; what to document ${safe(3)}.`,
+          ]) +
+          sec("Initial Management", [
+            `ABCDE, analgesia, immobilization, ortho consult ${safe(1)}.`,
+          ]) +
+          sec("Definitive/Follow-up", [
+            `Indications for reduction/pinning; rehab; follow-up ${safe(2)}.`,
+          ]);
       }
     }
 
     // 5) Return
-    const publicSources = sources.map(({ id, title, url }) => ({ id, title, url }));
-    return NextResponse.json({ answer: htmlAnswer, sources: publicSources, mode }, { status: 200 });
+    const publicSources = sources.map(({ id, title, url }) => ({
+      id,
+      title,
+      url,
+    }));
+    return NextResponse.json(
+      { answer: htmlAnswer, sources: publicSources, mode },
+      { status: 200 }
+    );
   } catch (e: any) {
-    return NextResponse.json({ error: e.message || "Server error." }, { status: 500 });
+    return NextResponse.json(
+      { error: e.message || "Server error." },
+      { status: 500 }
+    );
   }
 }
