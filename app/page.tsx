@@ -2,7 +2,6 @@
 
 import { useState } from 'react';
 
-// Read the Make.com feedback webhook from env (set in Vercel)
 const FEEDBACK_HOOK = process.env.NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL || '';
 
 type Source = { id?: number; title: string; url: string };
@@ -21,7 +20,6 @@ export default function Page() {
     setRated(null);
     setToast('');
     try {
-      // call your existing API route that generates the answer
       const res = await fetch('/api/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -29,7 +27,6 @@ export default function Page() {
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      // expect: { answer_html: string, sources_json: Source[] | string }
       setAnswerHtml(data.answer_html || '');
       const src = Array.isArray(data.sources_json)
         ? data.sources_json
@@ -61,11 +58,11 @@ export default function Page() {
           q,
           answerHtml,
           sources,
-          rating, // <-- what Make maps into the "rating" column
+          rating,
         }),
       });
     } catch {
-      // swallow; we don't block the UI on feedback errors
+      // ignore webhook errors
     }
   }
 
@@ -74,7 +71,7 @@ export default function Page() {
       <h1 className="text-3xl font-semibold">Project Devi</h1>
       <p className="text-sm text-gray-500">Minimal medical Q&amp;A with live sources.</p>
 
-      <div className="flex gap-2">
+      <div className="flex gap-2 flex-wrap">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
@@ -105,8 +102,6 @@ export default function Page() {
 
       <section className="space-y-3">
         <h2 className="text-xl font-semibold">Answer</h2>
-        <div className="text-sm text-gray-500">Mode: {mode}</div>
-
         <div
           className="prose max-w-none prose-ul:my-2 prose-li:my-1"
           dangerouslySetInnerHTML={{ __html: answerHtml || '<p class="text-gray-400">—</p>' }}
@@ -135,31 +130,23 @@ export default function Page() {
         <button
           onClick={() => rate('up')}
           disabled={rated !== null}
-          aria-label="Thumbs up"
           className={`rounded border px-2 py-1 text-sm ${
             rated === 'up' ? 'bg-green-600 text-white' : 'bg-white'
           }`}
         >
-          👍
+          Good
         </button>
         <button
           onClick={() => rate('down')}
           disabled={rated !== null}
-          aria-label="Thumbs down"
           className={`rounded border px-2 py-1 text-sm ${
             rated === 'down' ? 'bg-red-600 text-white' : 'bg-white'
           }`}
         >
-          👎
+          Bad
         </button>
         <span className="text-xs text-gray-500">{toast}</span>
       </section>
-
-      {!FEEDBACK_HOOK && (
-        <p className="text-xs text-amber-600">
-          Set <code>NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL</code> in Vercel to capture ratings in Sheets.
-        </p>
-      )}
     </main>
   );
 }
