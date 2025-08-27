@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "radiology" | "emergency" | "ortho";
 type Source = { id: number; title: string; url: string; preview?: string };
@@ -22,25 +22,29 @@ type HistoryItem = {
 };
 
 const MAX_HISTORY = 10;
+const LS_HISTORY = "devihist";
+const LS_MODE = "devimode";
 
+/* ---------- Follow-up chips per mode ---------- */
 function defaultFollowUps(mode: Mode | "auto" | undefined): string[] {
   const s = mode ?? "auto";
   if (s === "radiology") {
     return [
-      "Key signs and measurements to report?",
-      "Give a one-line impression with urgency/next step.",
+      "Key signs & measurements to report?",
+      "One-line impression with urgency/next step.",
       "Top differentials and how to distinguish?",
-      "Report template (Indication, Technique, Findings, Impression)?",
+      "Report format (Indication, Technique, Findings, Impression)?",
     ];
   }
   if (s === "emergency") {
     return [
-      "Immediate red flags and resus indications?",
+      "Immediate red flags & resus indications?",
       "ABCDE steps with examples (drugs/doses)?",
       "When to reduce/splint and call ortho?",
-      "Disposition criteria and review window?",
+      "Disposition criteria & review window?",
     ];
   }
+  // Ortho (or Auto as default)
   return [
     "Full classification with radiographic criteria?",
     "Nerve/artery injuries to document and follow?",
@@ -58,25 +62,40 @@ export default function Home() {
   const [serverMode, setServerMode] = useState<Mode | undefined>();
   const [confidence, setConfidence] = useState<ApiResp["confidence"]>();
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [copied, setCopied] = useState(false);
+  const startedAtRef = useRef<number | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
 
+  /* ---------- hydrate history + mode ---------- */
   useEffect(() => {
     try {
-      const raw = localStorage.getItem("devihist");
+      const raw = localStorage.getItem(LS_HISTORY);
       if (raw) setHistory(JSON.parse(raw));
+      const m = localStorage.getItem(LS_MODE) as "auto" | Mode | null;
+      if (m) setMode(m);
     } catch {}
   }, []);
 
+  /* ---------- persist history + mode ---------- */
   useEffect(() => {
     try {
-      localStorage.setItem("devihist", JSON.stringify(history.slice(0, MAX_HISTORY)));
+      localStorage.setItem(LS_HISTORY, JSON.stringify(history.slice(0, MAX_HISTORY)));
     } catch {}
   }, [history]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_MODE, mode);
+    } catch {}
+  }, [mode]);
 
+  /* ---------- ask API ---------- */
   async function ask(text?: string, override?: "auto" | Mode) {
     const question = (text ?? q).trim();
     if (!question) return;
 
     setLoading(true);
+    startedAtRef.current = Date.now();
+    setLatencyMs(null);
     setHtml("");
     setSources([]);
     setServerMode(undefined);
@@ -92,7 +111,9 @@ export default function Home() {
       body: JSON.stringify(body),
     });
     const data = (await r.json()) as ApiResp;
+
     setLoading(false);
+    if (startedAtRef.current) setLatencyMs(Date.now() - startedAtRef.current);
 
     if (!r.ok || data.error) {
       setHtml(`<div style="color:#b00">${data.error || "Something went wrong."}</div>`);
@@ -111,12 +132,27 @@ export default function Home() {
       sources: data.sources || [],
       ts: Date.now(),
     };
-    setHistory(prev => [item, ...prev].slice(0, MAX_HISTORY));
+    setHistory((prev) => [item, ...prev].slice(0, MAX_HISTORY));
   }
 
-  function copyAnswer() {
+  /* ---------- keyboard: Cmd/Ctrl+Enter ---------- */
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      ask();
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      ask();
+    }
+  }
+
+  /* ---------- copy ---------- */
+  async function copyAnswer() {
     const plain = html.replace(/<[^>]+>/g, "").trim();
-    navigator.clipboard.writeText(plain);
+    try {
+      await navigator.clipboard.writeText(plain);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 900);
+    } catch {}
   }
 
   const followups = useMemo(() => defaultFollowUps(serverMode ?? mode), [serverMode, mode]);
@@ -125,7 +161,7 @@ export default function Home() {
     <main style={{ maxWidth: 980, margin: "40px auto", padding: "0 20px" }}>
       <header style={{ marginBottom: 14 }}>
         <h1 style={{ fontSize: 34, margin: 0 }}>Project Devi</h1>
-        <div style={{ color: "#667085", marginTop: 4 }}>Structured medical answers with live sources.</div>
+        <div style={{ color: "#667085", marginTop: 4 }}>Structured medical Q&amp;A with live sources.</div>
       </header>
 
       {/* Query row */}
@@ -134,7 +170,9 @@ export default function Home() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Ask a question (e.g., Gartland II supracondylar humerus fracture)…"
-          onKeyDown={(e) => e.key === "Enter" && ask()}
+          onKeyDown={onKeyDown}
+          spellCheck={false}
+          autoFocus
           style={{
             flex: 1,
             padding: "14px 16px",
@@ -166,17 +204,18 @@ export default function Home() {
         </div>
         <button
           onClick={() => ask()}
-          disabled={loading}
+          disabled={loading || !q.trim()}
           style={{
             padding: "12px 18px",
             borderRadius: 10,
-            background: "#111827",
+            background: loading || !q.trim() ? "#9ca3af" : "#111827",
             color: "#fff",
             border: "none",
-            cursor: "pointer",
+            cursor: loading || !q.trim() ? "not-allowed" : "pointer",
             fontWeight: 600,
             minWidth: 88,
           }}
+          title="Cmd/Ctrl + Enter"
         >
           {loading ? "Asking…" : "Ask"}
         </button>
@@ -224,7 +263,7 @@ export default function Home() {
             gap: 10,
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <div style={{ fontWeight: 700, fontSize: 20 }}>Answer</div>
             {serverMode && (
               <span
@@ -245,7 +284,12 @@ export default function Home() {
                 style={{
                   fontSize: 12,
                   padding: "3px 8px",
-                  background: confidence.band === "High" ? "#e8f7ed" : confidence.band === "Moderate" ? "#fff8e6" : "#fdecec",
+                  background:
+                    confidence.band === "High"
+                      ? "#e8f7ed"
+                      : confidence.band === "Moderate"
+                      ? "#fff8e6"
+                      : "#fdecec",
                   border: "1px solid #e5e7eb",
                   borderRadius: 999,
                 }}
@@ -254,19 +298,34 @@ export default function Home() {
                 Confidence: {confidence.band} ({confidence.pct}%)
               </span>
             )}
+            {latencyMs !== null && (
+              <span
+                style={{
+                  fontSize: 12,
+                  padding: "3px 8px",
+                  background: "#f3f4f6",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 999,
+                }}
+                title="Response time"
+              >
+                {Math.round(latencyMs)} ms
+              </span>
+            )}
           </div>
           <button
             onClick={copyAnswer}
             style={{
               fontSize: 12,
               border: "1px solid #e5e7eb",
-              background: "#fff",
+              background: copied ? "#e8f7ed" : "#fff",
               borderRadius: 8,
               padding: "6px 10px",
               cursor: "pointer",
             }}
+            title="Copy plain text"
           >
-            Copy
+            {copied ? "Copied!" : "Copy"}
           </button>
         </div>
 
