@@ -11,8 +11,7 @@ type TavilyResp = { results?: TavilyItem[] };
 const TAVILY_KEY = process.env.TAVILY_API_KEY!;
 const GEMINI_KEY = process.env.GEMINI_API_KEY!;
 
-// Optional: Make.com / n8n webhook that stores feedback rows
-// (We fire-and-forget a POST with question, mode, answer, sources)
+// Optional telemetry webhook (Make.com / n8n, etc.)
 const FEEDBACK_WEBHOOK_URL = process.env.FEEDBACK_WEBHOOK_URL || "";
 
 /* ------------------------------------------------------------------ */
@@ -86,7 +85,6 @@ function sectionTitles(mode: Mode): string[] {
       "Disposition/Follow-up",
     ];
   }
-  // Ortho default
   return [
     "Classification",
     "Risk Factors",
@@ -102,7 +100,6 @@ function sectionTitles(mode: Mode): string[] {
 async function webSearch(q: string): Promise<TavilyItem[]> {
   if (!TAVILY_KEY) return [];
 
-  // Bias for India-relevant / guideline sources
   const include_domains = [
     "aiims.edu",
     "icmr.gov.in",
@@ -124,6 +121,8 @@ async function webSearch(q: string): Promise<TavilyItem[]> {
       max_results: 10,
       include_domains,
     }),
+    // @ts-ignore — some environments need this hint
+    next: { revalidate: 0 },
   });
 
   if (!r.ok) return [];
@@ -190,7 +189,6 @@ export async function POST(req: NextRequest) {
       content: (h.content || "").slice(0, 1400),
     }));
 
-    // If no sources, return a graceful message (still log to webhook)
     if (sources.length === 0) {
       const html = `<div>No reliable sources found for this query. Please rephrase or try a more specific question.</div>`;
       void postFeedback({ mode, question, answer_html: html, sources });
@@ -212,7 +210,6 @@ export async function POST(req: NextRequest) {
       .join("\n\n");
 
     const sectionList = titles.map((t, i) => `${i + 1}) ${t}`).join("\n");
-
     const modeHint =
       mode === "radiology"
         ? "Radiology summary for Indian MBBS interns / JRs. Keep it exam-ready and reporting oriented."
@@ -245,25 +242,24 @@ SOURCES:
 ${numberedContext}
 `.trim();
 
-    /* 3) Call Gemini */
+    /* 3) Call Gemini — pass a plain string to avoid Part/role typing issues */
     let htmlAnswer = "";
     if (GEMINI_KEY) {
       try {
         const genAI = new GoogleGenerativeAI(GEMINI_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const result = await model.generateContent([
-          { role: "user", parts: [{ text: `Question: ${question}\n\n${systemPrompt}` }] },
-        ]);
+        const prompt = `Question: ${question}\n\n${systemPrompt}`;
+        const result = await model.generateContent(prompt);
         const raw = (result.response.text() || "").trim();
         const maybeHtml = stripFences(raw);
         const looksHtml = /<ul|<div/i.test(maybeHtml);
         htmlAnswer = looksHtml ? maybeHtml : "";
       } catch {
-        // swallow and fallback below
+        // swallow and fall back
       }
     }
 
-    /* 4) Fallback template (if LLM failed) */
+    /* 4) Fallback template */
     if (!htmlAnswer) {
       const safe = (i: number) => `[${i}]`;
       if (mode === "radiology") {
@@ -290,10 +286,9 @@ ${numberedContext}
       }
     }
 
-    // Clean up duplicated “[n]. [n]” etc.
     htmlAnswer = dedupeCitations(htmlAnswer);
 
-    /* 5) Return and (optionally) log to webhook */
+    /* 5) Return + optional telemetry */
     const publicSources = sources.map(({ id, title, url }) => ({ id, title, url }));
     const payload = {
       ts: new Date().toISOString(),
@@ -303,7 +298,6 @@ ${numberedContext}
       sources: publicSources,
     };
 
-    // fire-and-forget (do not block user)
     void postFeedback(payload);
 
     return NextResponse.json(
@@ -339,12 +333,12 @@ async function postFeedback(params: {
         question: params.question,
         answer_html: params.answer_html,
         sources_json: params.sources,
-        rating: "", // reserved
-        confidence_band: "", // reserved
-        confidence_pct: "", // reserved
+        rating: "",
+        confidence_band: "",
+        confidence_pct: "",
       }),
     });
   } catch {
-    // don't throw – telemetry is best-effort
+    // best-effort only
   }
 }
