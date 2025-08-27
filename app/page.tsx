@@ -71,7 +71,6 @@ function defaultFollowUps(mode: Mode | "auto" | undefined): string[] {
 
 /* ---------- HTML → Markdown (simple, robust) ---------- */
 function htmlToMarkdown(html: string): string {
-  // Convert section titles and bullets from our known structure
   const tmp = document.createElement("div");
   tmp.innerHTML = html;
 
@@ -94,10 +93,18 @@ function htmlToMarkdown(html: string): string {
 }
 
 /* ---------- Build full Markdown doc ---------- */
-function buildMarkdownDoc(q: string, mode: Mode | "auto" | undefined, confidence: ApiResp["confidence"], bodyMd: string, sources: Source[]): string {
-  const header = `# Project Devi\n\n**Question:** ${q}\n\n**Mode:** ${mode ?? "auto"}${confidence ? `\n\n**Confidence:** ${confidence.band} (${confidence.pct}%)` : ""}\n`;
+function buildMarkdownDoc(
+  q: string,
+  mode: Mode | "auto" | undefined,
+  confidence: ApiResp["confidence"],
+  bodyMd: string,
+  sources: Source[]
+): string {
+  const header = `# Project Devi\n\n**Question:** ${q}\n\n**Mode:** ${mode ?? "auto"}${
+    confidence ? `\n\n**Confidence:** ${confidence.band} (${confidence.pct}%)` : ""
+  }\n`;
   const refs = sources.length
-    ? `\n\n## Sources\n${sources.map(s => `1. [${s.title}](${s.url})`).join("\n")}\n`
+    ? `\n\n## Sources\n${sources.map((s) => `1. [${s.title}](${s.url})`).join("\n")}\n`
     : "";
   const disclaimer = `\n---\n*Educational use only. Not a medical device or a substitute for clinical judgement.*\n`;
   return `${header}\n${bodyMd}\n${refs}${disclaimer}`;
@@ -156,7 +163,7 @@ export default function Home() {
 
     const body: any = { question };
     const chosen = override ?? mode;
-    if (chosen !== "auto") body.modeOverride = chosen;
+    if (chosen !== "auto") body.mode = chosen; // name matches backend
 
     const r = await fetch("/api/answer", {
       method: "POST",
@@ -166,17 +173,20 @@ export default function Home() {
     const data = (await r.json()) as ApiResp;
 
     setLoading(false);
-    if (startedAtRef.current) setLatencyMs(Date.now() - startedAtRef.current);
+    const elapsed = startedAtRef.current ? Date.now() - startedAtRef.current : null;
+    if (elapsed !== null) setLatencyMs(elapsed);
 
     if (!r.ok || data.error) {
       setHtml(`<div style="color:#b00">${data.error || "Something went wrong."}</div>`);
       return;
     }
+
     setHtml(data.answer || "");
     setSources(data.sources || []);
     setServerMode(data.mode);
     setConfidence(data.confidence);
 
+    // Save in local history
     const item: HistoryItem = {
       id: String(Date.now()),
       q: question,
@@ -186,6 +196,33 @@ export default function Home() {
       ts: Date.now(),
     };
     setHistory((prev) => [item, ...prev].slice(0, MAX_HISTORY));
+
+    // ---- NEW: Auto log to Make/Google Sheets (fire & forget) ----
+    if (WEBHOOK) {
+      try {
+        const confidence_band =
+          data.confidence?.band ??
+          (data.sources && data.sources.length >= 6 ? "High" : data.sources && data.sources.length >= 3 ? "Moderate" : "Preliminary");
+        const confidence_pct = data.confidence?.pct ?? (data.sources ? Math.min(95, data.sources.length * 12) : 0);
+        await fetch(WEBHOOK, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ts: new Date().toISOString(),
+            mode: data.mode || (chosen === "auto" ? "ortho" : chosen), // fallback
+            question,
+            answer_html: data.answer || "",
+            sources_json: data.sources || [],
+            rating: "", // empty by default; user can later thumbs up/down
+            confidence_band,
+            confidence_pct,
+            latency_ms: elapsed ?? "",
+          }),
+        });
+      } catch {
+        // do not block UI on logging errors
+      }
+    }
   }
 
   /* ---------- keyboard: Enter / Cmd+Enter ---------- */
@@ -217,7 +254,6 @@ export default function Home() {
   }
 
   function printSheet() {
-    // Add minimal print CSS for tighter margins
     const id = "print-css";
     if (!document.getElementById(id)) {
       const style = document.createElement("style");
@@ -236,7 +272,7 @@ export default function Home() {
     window.print();
   }
 
-  /* ---------- Feedback ---------- */
+  /* ---------- Feedback (manual thumbs up/down) ---------- */
   async function submitFeedback(rating: "up" | "down") {
     const fb: FeedbackItem = {
       id: String(Date.now()),
@@ -250,7 +286,6 @@ export default function Home() {
       ts: Date.now(),
     };
 
-    // Save locally
     try {
       const raw = localStorage.getItem(LS_FEEDBACK);
       const arr: FeedbackItem[] = raw ? JSON.parse(raw) : [];
@@ -258,7 +293,6 @@ export default function Home() {
       localStorage.setItem(LS_FEEDBACK, JSON.stringify(arr.slice(0, 200)));
     } catch {}
 
-    // Optional: send to webhook if configured
     if (WEBHOOK) {
       try {
         await fetch(WEBHOOK, {
@@ -365,16 +399,25 @@ export default function Home() {
       {/* Action bar: export + feedback */}
       <div className="no-print" style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={copyMarkdown} disabled={!html}
-            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+          <button
+            onClick={copyMarkdown}
+            disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}
+          >
             Copy Markdown
           </button>
-          <button onClick={downloadMarkdown} disabled={!html}
-            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+          <button
+            onClick={downloadMarkdown}
+            disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}
+          >
             Download .md
           </button>
-          <button onClick={printSheet} disabled={!html}
-            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+          <button
+            onClick={printSheet}
+            disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}
+          >
             Print / Save as PDF
           </button>
         </div>
@@ -605,12 +648,38 @@ export default function Home() {
 
       {/* Tiny toasts */}
       {copied && (
-        <div className="no-print" style={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#111", color: "#fff", borderRadius: 999, padding: "6px 10px", fontSize: 12 }}>
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            bottom: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#111",
+            color: "#fff",
+            borderRadius: 999,
+            padding: "6px 10px",
+            fontSize: 12,
+          }}
+        >
           Copied!
         </div>
       )}
       {feedbackToast && (
-        <div className="no-print" style={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#111", color: "#fff", borderRadius: 999, padding: "6px 10px", fontSize: 12 }}>
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            bottom: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#111",
+            color: "#fff",
+            borderRadius: 999,
+            padding: "6px 10px",
+            fontSize: 12,
+          }}
+        >
           {feedbackToast}
         </div>
       )}
