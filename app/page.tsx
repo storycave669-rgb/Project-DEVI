@@ -21,9 +21,25 @@ type HistoryItem = {
   ts: number;
 };
 
+type FeedbackItem = {
+  id: string;
+  q: string;
+  mode: Mode | "auto" | undefined;
+  confidence?: ApiResp["confidence"];
+  rating: "up" | "down";
+  comment?: string;
+  answerHtml: string;
+  sources: Source[];
+  ts: number;
+};
+
 const MAX_HISTORY = 10;
 const LS_HISTORY = "devihist";
 const LS_MODE = "devimode";
+const LS_FEEDBACK = "devifeedback";
+
+// Optional webhook (set this in Vercel Project Settings → Environment Variables)
+const WEBHOOK = process.env.NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL;
 
 /* ---------- Follow-up chips per mode ---------- */
 function defaultFollowUps(mode: Mode | "auto" | undefined): string[] {
@@ -53,6 +69,40 @@ function defaultFollowUps(mode: Mode | "auto" | undefined): string[] {
   ];
 }
 
+/* ---------- HTML → Markdown (simple, robust) ---------- */
+function htmlToMarkdown(html: string): string {
+  // Convert section titles and bullets from our known structure
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+
+  const lines: string[] = [];
+  const blocks = tmp.querySelectorAll("div[style*='font-weight:700']");
+
+  blocks.forEach((titleDiv) => {
+    const title = titleDiv.textContent?.trim() || "";
+    if (!title) return;
+    lines.push(`\n### ${title}\n`);
+    const ul = titleDiv.nextElementSibling as HTMLUListElement | null;
+    if (ul && ul.tagName.toLowerCase() === "ul") {
+      ul.querySelectorAll("li").forEach((li) => {
+        lines.push(`- ${li.textContent?.trim() || ""}`);
+      });
+    }
+  });
+
+  return lines.join("\n").trim();
+}
+
+/* ---------- Build full Markdown doc ---------- */
+function buildMarkdownDoc(q: string, mode: Mode | "auto" | undefined, confidence: ApiResp["confidence"], bodyMd: string, sources: Source[]): string {
+  const header = `# Project Devi\n\n**Question:** ${q}\n\n**Mode:** ${mode ?? "auto"}${confidence ? `\n\n**Confidence:** ${confidence.band} (${confidence.pct}%)` : ""}\n`;
+  const refs = sources.length
+    ? `\n\n## Sources\n${sources.map(s => `1. [${s.title}](${s.url})`).join("\n")}\n`
+    : "";
+  const disclaimer = `\n---\n*Educational use only. Not a medical device or a substitute for clinical judgement.*\n`;
+  return `${header}\n${bodyMd}\n${refs}${disclaimer}`;
+}
+
 export default function Home() {
   const [q, setQ] = useState("");
   const [mode, setMode] = useState<"auto" | Mode>("auto");
@@ -63,6 +113,9 @@ export default function Home() {
   const [confidence, setConfidence] = useState<ApiResp["confidence"]>();
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [copied, setCopied] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState<"up" | "down" | null>(null);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackToast, setFeedbackToast] = useState("");
   const startedAtRef = useRef<number | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
 
@@ -135,24 +188,91 @@ export default function Home() {
     setHistory((prev) => [item, ...prev].slice(0, MAX_HISTORY));
   }
 
-  /* ---------- keyboard: Cmd/Ctrl+Enter ---------- */
+  /* ---------- keyboard: Enter / Cmd+Enter ---------- */
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      ask();
-    }
-    if (e.key === "Enter" && !e.shiftKey) {
-      ask();
-    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") ask();
+    if (e.key === "Enter" && !e.shiftKey) ask();
   }
 
-  /* ---------- copy ---------- */
-  async function copyAnswer() {
-    const plain = html.replace(/<[^>]+>/g, "").trim();
+  /* ---------- Copy Markdown / Download / Print ---------- */
+  async function copyMarkdown() {
+    const md = buildMarkdownDoc(q, serverMode ?? mode, confidence, htmlToMarkdown(html), sources);
     try {
-      await navigator.clipboard.writeText(plain);
+      await navigator.clipboard.writeText(md);
       setCopied(true);
       setTimeout(() => setCopied(false), 900);
     } catch {}
+  }
+
+  function downloadMarkdown() {
+    const md = buildMarkdownDoc(q, serverMode ?? mode, confidence, htmlToMarkdown(html), sources);
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeName = (q || "project-devi").replace(/[^a-z0-9\-]+/gi, "-").toLowerCase();
+    a.href = url;
+    a.download = `${safeName}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function printSheet() {
+    // Add minimal print CSS for tighter margins
+    const id = "print-css";
+    if (!document.getElementById(id)) {
+      const style = document.createElement("style");
+      style.id = id;
+      style.innerHTML = `
+        @media print {
+          body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          main { max-width: 800px !important; }
+          .no-print { display: none !important; }
+          .answer ul { margin: 6px 0 12px 20px; }
+          .answer div[style*="font-weight:700"] { margin-top: 8px; }
+        }
+      `;
+      document.head.appendChild(style);
+    }
+    window.print();
+  }
+
+  /* ---------- Feedback ---------- */
+  async function submitFeedback(rating: "up" | "down") {
+    const fb: FeedbackItem = {
+      id: String(Date.now()),
+      q,
+      mode: serverMode ?? mode,
+      confidence,
+      rating,
+      comment: feedbackText.trim() || undefined,
+      answerHtml: html,
+      sources,
+      ts: Date.now(),
+    };
+
+    // Save locally
+    try {
+      const raw = localStorage.getItem(LS_FEEDBACK);
+      const arr: FeedbackItem[] = raw ? JSON.parse(raw) : [];
+      arr.unshift(fb);
+      localStorage.setItem(LS_FEEDBACK, JSON.stringify(arr.slice(0, 200)));
+    } catch {}
+
+    // Optional: send to webhook if configured
+    if (WEBHOOK) {
+      try {
+        await fetch(WEBHOOK, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(fb),
+        });
+      } catch {}
+    }
+
+    setFeedbackText("");
+    setFeedbackOpen(null);
+    setFeedbackToast("Thanks for the feedback!");
+    setTimeout(() => setFeedbackToast(""), 1200);
   }
 
   const followups = useMemo(() => defaultFollowUps(serverMode ?? mode), [serverMode, mode]);
@@ -165,7 +285,7 @@ export default function Home() {
       </header>
 
       {/* Query row */}
-      <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
+      <div className="no-print" style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10 }}>
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
@@ -215,14 +335,14 @@ export default function Home() {
             fontWeight: 600,
             minWidth: 88,
           }}
-          title="Cmd/Ctrl + Enter"
+          title="Enter or Cmd/Ctrl + Enter"
         >
           {loading ? "Asking…" : "Ask"}
         </button>
       </div>
 
       {/* Follow-up suggestions */}
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+      <div className="no-print" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
         {followups.map((f, i) => (
           <button
             key={i}
@@ -240,6 +360,43 @@ export default function Home() {
             {f}
           </button>
         ))}
+      </div>
+
+      {/* Action bar: export + feedback */}
+      <div className="no-print" style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={copyMarkdown} disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+            Copy Markdown
+          </button>
+          <button onClick={downloadMarkdown} disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+            Download .md
+          </button>
+          <button onClick={printSheet} disabled={!html}
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 10px", cursor: html ? "pointer" : "not-allowed" }}>
+            Print / Save as PDF
+          </button>
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <button
+            onClick={() => setFeedbackOpen("up")}
+            disabled={!html}
+            title="Helpful"
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 999, padding: "6px 10px", cursor: html ? "pointer" : "not-allowed" }}
+          >
+            👍
+          </button>
+          <button
+            onClick={() => setFeedbackOpen("down")}
+            disabled={!html}
+            title="Needs work"
+            style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 999, padding: "6px 10px", cursor: html ? "pointer" : "not-allowed" }}
+          >
+            👎
+          </button>
+        </div>
       </div>
 
       {/* Answer card */}
@@ -313,20 +470,6 @@ export default function Home() {
               </span>
             )}
           </div>
-          <button
-            onClick={copyAnswer}
-            style={{
-              fontSize: 12,
-              border: "1px solid #e5e7eb",
-              background: copied ? "#e8f7ed" : "#fff",
-              borderRadius: 8,
-              padding: "6px 10px",
-              cursor: "pointer",
-            }}
-            title="Copy plain text"
-          >
-            {copied ? "Copied!" : "Copy"}
-          </button>
         </div>
 
         <div style={{ padding: 16, minHeight: 120 }}>
@@ -366,7 +509,7 @@ export default function Home() {
 
       {/* History */}
       {history.length > 0 && (
-        <section style={{ marginTop: 20 }}>
+        <section className="no-print" style={{ marginTop: 20 }}>
           <div style={{ fontWeight: 700, marginBottom: 8 }}>Recent</div>
           <div style={{ display: "grid", gap: 8 }}>
             {history.map((h) => (
@@ -396,6 +539,80 @@ export default function Home() {
             ))}
           </div>
         </section>
+      )}
+
+      {/* Feedback dialog */}
+      {feedbackOpen && (
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setFeedbackOpen(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "100%",
+              maxWidth: 480,
+              background: "#fff",
+              borderRadius: 12,
+              border: "1px solid #e5e7eb",
+              boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
+              padding: 16,
+            }}
+          >
+            <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>
+              {feedbackOpen === "up" ? "What was helpful?" : "What should be improved?"}
+            </div>
+            <textarea
+              value={feedbackText}
+              onChange={(e) => setFeedbackText(e.target.value)}
+              placeholder="Optional comment (e.g., missing guideline, wrong emphasis, unclear step)…"
+              rows={4}
+              style={{
+                width: "100%",
+                border: "1px solid #e5e7eb",
+                borderRadius: 8,
+                padding: 10,
+                outline: "none",
+                resize: "vertical",
+              }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setFeedbackOpen(null)}
+                style={{ border: "1px solid #e5e7eb", background: "#fff", borderRadius: 8, padding: "8px 12px" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => submitFeedback(feedbackOpen)}
+                style={{ border: "none", background: "#111827", color: "#fff", borderRadius: 8, padding: "8px 12px" }}
+              >
+                Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tiny toasts */}
+      {copied && (
+        <div className="no-print" style={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#111", color: "#fff", borderRadius: 999, padding: "6px 10px", fontSize: 12 }}>
+          Copied!
+        </div>
+      )}
+      {feedbackToast && (
+        <div className="no-print" style={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: "#111", color: "#fff", borderRadius: 999, padding: "6px 10px", fontSize: 12 }}>
+          {feedbackToast}
+        </div>
       )}
     </main>
   );
