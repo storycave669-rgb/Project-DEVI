@@ -2,240 +2,177 @@
 
 import { useState } from 'react';
 
-interface Source {
-  title: string;
-  url: string;
-  id?: number;
-}
+// Read the Make.com feedback webhook from env (set in Vercel)
+const FEEDBACK_HOOK = process.env.NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL || '';
 
-interface ApiResponse {
-  answer_html: string;
-  sources_json: Source[] | string;
-}
+type Source = { id?: number; title: string; url: string };
 
-interface FeedbackPayload {
-  ts: string;
-  mode: string;
-  q: string;
-  answerHtml: string;
-  sources: Source[];
-  rating: 'up' | 'down';
-}
-
-export default function HomePage() {
-  const [question, setQuestion] = useState('');
-  const [mode, setMode] = useState('auto');
+export default function Page() {
+  const [mode, setMode] = useState<'auto' | 'radiology' | 'emergency' | 'ortho'>('auto');
+  const [q, setQ] = useState('');
+  const [answerHtml, setAnswerHtml] = useState<string>('');
+  const [sources, setSources] = useState<Source[]>([]);
   const [loading, setLoading] = useState(false);
-  const [response, setResponse] = useState<ApiResponse | null>(null);
-  const [feedbackGiven, setFeedbackGiven] = useState(false);
-  const [feedbackLoading, setFeedbackLoading] = useState(false);
+  const [rated, setRated] = useState<'up' | 'down' | null>(null);
+  const [toast, setToast] = useState<string>('');
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!question.trim()) return;
-
+  async function ask() {
     setLoading(true);
-    setResponse(null);
-    setFeedbackGiven(false);
-
+    setRated(null);
+    setToast('');
     try {
+      // call your existing API route that generates the answer
       const res = await fetch('/api/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, question }),
+        body: JSON.stringify({ mode, question: q }),
       });
-
-      if (!res.ok) throw new Error('Failed to get answer');
-      
-      const data: ApiResponse = await res.json();
-      setResponse(data);
-    } catch (error) {
-      console.error('Error:', error);
-      setResponse({
-        answer_html: '<p class="text-red-600">Error: Failed to get answer. Please try again.</p>',
-        sources_json: []
-      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      // expect: { answer_html: string, sources_json: Source[] | string }
+      setAnswerHtml(data.answer_html || '');
+      const src = Array.isArray(data.sources_json)
+        ? data.sources_json
+        : safeParseArray(data.sources_json);
+      setSources(src);
+    } catch (e: any) {
+      setAnswerHtml(`<p class="text-red-600">Error: ${e?.message || 'Failed'}</p>`);
+      setSources([]);
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const handleFeedback = async (rating: 'up' | 'down') => {
-    if (!response || feedbackGiven) return;
-
-    setFeedbackLoading(true);
-
-    // Parse sources_json safely
-    let sources: Source[] = [];
-    try {
-      if (Array.isArray(response.sources_json)) {
-        sources = response.sources_json;
-      } else if (typeof response.sources_json === 'string') {
-        sources = JSON.parse(response.sources_json);
-      }
-    } catch (error) {
-      console.error('Error parsing sources:', error);
-      sources = [];
+  async function rate(rating: 'up' | 'down') {
+    if (rated || !FEEDBACK_HOOK) {
+      setRated(rating);
+      if (!FEEDBACK_HOOK) setToast('Feedback webhook not configured');
+      return;
     }
-
-    const payload: FeedbackPayload = {
-      ts: new Date().toISOString(),
-      mode,
-      q: question,
-      answerHtml: response.answer_html,
-      sources,
-      rating
-    };
-
-    const webhookUrl = process.env.NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL;
-    
-    if (webhookUrl) {
-      try {
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-      } catch (error) {
-        console.error('Error sending feedback:', error);
-      }
-    }
-
-    setFeedbackGiven(true);
-    setFeedbackLoading(false);
-  };
-
-  // Parse sources for display
-  const parsedSources: Source[] = response ? (() => {
+    setRated(rating);
+    setToast('Thanks!');
     try {
-      if (Array.isArray(response.sources_json)) {
-        return response.sources_json;
-      } else if (typeof response.sources_json === 'string') {
-        return JSON.parse(response.sources_json);
-      }
-      return [];
+      await fetch(FEEDBACK_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ts: new Date().toISOString(),
+          mode,
+          q,
+          answerHtml,
+          sources,
+          rating, // <-- what Make maps into the "rating" column
+        }),
+      });
     } catch {
-      return [];
+      // swallow; we don't block the UI on feedback errors
     }
-  })() : [];
+  }
 
   return (
-    <div className="min-h-screen bg-gray-50 py-8">
-      <div className="max-w-4xl mx-auto px-4">
-        <div className="bg-white rounded-lg shadow-md p-6">
-          <h1 className="text-3xl font-bold text-gray-900 mb-8 text-center">
-            Medical AI Assistant
-          </h1>
+    <main className="mx-auto max-w-4xl p-6 space-y-6">
+      <h1 className="text-3xl font-semibold">Project Devi</h1>
+      <p className="text-sm text-gray-500">Minimal medical Q&amp;A with live sources.</p>
 
-          <form onSubmit={handleSubmit} className="mb-8">
-            <div className="mb-4">
-              <label htmlFor="mode" className="block text-sm font-medium text-gray-700 mb-2">
-                Mode
-              </label>
-              <select
-                id="mode"
-                value={mode}
-                onChange={(e) => setMode(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              >
-                <option value="auto">Auto</option>
-                <option value="radiology">Radiology</option>
-                <option value="emergency">Emergency</option>
-                <option value="ortho">Orthopedics</option>
-              </select>
-            </div>
-
-            <div className="mb-4">
-              <label htmlFor="question" className="block text-sm font-medium text-gray-700 mb-2">
-                Question
-              </label>
-              <textarea
-                id="question"
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                placeholder="Enter your medical question..."
-                rows={4}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-vertical"
-                required
-              />
-            </div>
-
+      <div className="flex gap-2">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Ask a clinical question…"
+          className="flex-1 rounded border px-3 py-2"
+        />
+        <div className="flex gap-2">
+          {(['auto', 'radiology', 'emergency', 'ortho'] as const).map((m) => (
             <button
-              type="submit"
-              disabled={loading || !question.trim()}
-              className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              key={m}
+              onClick={() => setMode(m)}
+              className={`rounded border px-3 py-2 text-sm ${
+                m === mode ? 'bg-black text-white' : 'bg-white'
+              }`}
             >
-              {loading ? 'Getting Answer...' : 'Get Answer'}
+              {cap(m)}
             </button>
-          </form>
-
-          {response && (
-            <div className="border-t pt-6">
-              <div className="mb-6">
-                <h2 className="text-xl font-semibold text-gray-900 mb-4">Answer</h2>
-                <div 
-                  className="prose max-w-none"
-                  dangerouslySetInnerHTML={{ __html: response.answer_html }}
-                />
-              </div>
-
-              {parsedSources.length > 0 && (
-                <div className="mb-6">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-3">Sources</h3>
-                  <ul className="space-y-2">
-                    {parsedSources.map((source, index) => (
-                      <li key={source.id || index}>
-                        <a
-                          href={source.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:text-blue-800 underline"
-                        >
-                          {source.title}
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <div className="border-t pt-4">
-                <p className="text-sm text-gray-600 mb-3">Was this answer helpful?</p>
-                <div className="flex gap-3">
-                  <button
-                    onClick={() => handleFeedback('up')}
-                    disabled={feedbackGiven || feedbackLoading}
-                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-green-700 bg-green-50 border border-green-200 rounded-md hover:bg-green-100 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    <span>👍</span>
-                    Yes
-                  </button>
-                  <button
-                    onClick={() => handleFeedback('down')}
-                    disabled={feedbackGiven || feedbackLoading}
-                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-red-700 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    <span>👎</span>
-                    No
-                  </button>
-                </div>
-                
-                {feedbackGiven && (
-                  <p className="text-sm text-gray-500 mt-2">
-                    Thank you for your feedback!
-                  </p>
-                )}
-                
-                {!process.env.NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL && (
-                  <p className="text-xs text-gray-400 mt-2">
-                    Note: Feedback webhook not configured
-                  </p>
-                )}
-              </div>
-            </div>
-          )}
+          ))}
         </div>
+        <button
+          onClick={ask}
+          disabled={!q || loading}
+          className="rounded bg-indigo-600 px-4 py-2 text-white disabled:opacity-50"
+        >
+          {loading ? 'Thinking…' : 'Ask'}
+        </button>
       </div>
-    </div>
+
+      <section className="space-y-3">
+        <h2 className="text-xl font-semibold">Answer</h2>
+        <div className="text-sm text-gray-500">Mode: {mode}</div>
+
+        <div
+          className="prose max-w-none prose-ul:my-2 prose-li:my-1"
+          dangerouslySetInnerHTML={{ __html: answerHtml || '<p class="text-gray-400">—</p>' }}
+        />
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-lg font-semibold">Sources</h3>
+        {sources?.length ? (
+          <ul className="list-disc pl-6">
+            {sources.map((s, i) => (
+              <li key={i}>
+                <a className="text-blue-600 underline" href={s.url} target="_blank" rel="noreferrer">
+                  {s.title}
+                </a>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-gray-400 text-sm">—</div>
+        )}
+      </section>
+
+      <section className="flex items-center gap-3">
+        <span className="text-sm text-gray-600">Was this useful?</span>
+        <button
+          onClick={() => rate('up')}
+          disabled={rated !== null}
+          aria-label="Thumbs up"
+          className={`rounded border px-2 py-1 text-sm ${
+            rated === 'up' ? 'bg-green-600 text-white' : 'bg-white'
+          }`}
+        >
+          👍
+        </button>
+        <button
+          onClick={() => rate('down')}
+          disabled={rated !== null}
+          aria-label="Thumbs down"
+          className={`rounded border px-2 py-1 text-sm ${
+            rated === 'down' ? 'bg-red-600 text-white' : 'bg-white'
+          }`}
+        >
+          👎
+        </button>
+        <span className="text-xs text-gray-500">{toast}</span>
+      </section>
+
+      {!FEEDBACK_HOOK && (
+        <p className="text-xs text-amber-600">
+          Set <code>NEXT_PUBLIC_FEEDBACK_WEBHOOK_URL</code> in Vercel to capture ratings in Sheets.
+        </p>
+      )}
+    </main>
   );
+}
+
+function safeParseArray(v: any): Source[] {
+  try {
+    const j = typeof v === 'string' ? JSON.parse(v) : v;
+    return Array.isArray(j) ? j : [];
+  } catch {
+    return [];
+  }
+}
+
+function cap(s: string) {
+  return s[0].toUpperCase() + s.slice(1);
 }
